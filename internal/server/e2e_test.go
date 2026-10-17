@@ -78,7 +78,7 @@ type deliveryReport struct {
 }
 
 type fakeCore struct {
-	t     *testing.T
+	t     testing.TB
 	host  string
 	realm string
 	node  *diameter.Node
@@ -87,6 +87,8 @@ type fakeCore struct {
 	busy    atomic.Bool
 	dropSRR *atomic.Bool
 	busied  atomic.Int32
+	// delay is how long, in nanoseconds, the core takes to answer each request.
+	delay atomic.Int64
 
 	mu          sync.Mutex
 	subscribers map[string]subscriber
@@ -98,7 +100,7 @@ type fakeCore struct {
 	reports     []deliveryReport
 }
 
-func skipIfNoSCTP(t *testing.T) {
+func skipIfNoSCTP(t testing.TB) {
 	t.Helper()
 
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, syscall.IPPROTO_SCTP)
@@ -117,19 +119,19 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-func newFakeCore(t *testing.T, subscribers ...subscriber) *fakeCore {
+func newFakeCore(t testing.TB, subscribers ...subscriber) *fakeCore {
 	t.Helper()
 
 	return newNamedFakeCore(t, coreHost, subscribers...)
 }
 
-func newNamedFakeCore(t *testing.T, host string, subscribers ...subscriber) *fakeCore {
+func newNamedFakeCore(t testing.TB, host string, subscribers ...subscriber) *fakeCore {
 	t.Helper()
 
 	return newRealmFakeCore(t, host, realm, subscribers...)
 }
 
-func newRealmFakeCore(t *testing.T, host, originRealm string, subscribers ...subscriber) *fakeCore {
+func newRealmFakeCore(t testing.TB, host, originRealm string, subscribers ...subscriber) *fakeCore {
 	t.Helper()
 	skipIfNoSCTP(t)
 
@@ -174,6 +176,10 @@ func newRealmFakeCore(t *testing.T, host, originRealm string, subscribers ...sub
 }
 
 func (c *fakeCore) serve(ctx context.Context, _ *diameter.Conn, req *diameter.Message) *diameter.Message {
+	if d := time.Duration(c.delay.Load()); d > 0 {
+		time.Sleep(d)
+	}
+
 	switch req.CommandCode {
 	case s6c.CommandSendRoutingInfoForSM:
 		return c.routeOrFail(ctx, req)
@@ -482,7 +488,7 @@ func experimental(resultCode uint32, extra ...diameter.AVP) *diameter.Message {
 	}, extra...)}
 }
 
-func resultOf(t *testing.T, ans *diameter.Message) uint32 {
+func resultOf(t testing.TB, ans *diameter.Message) uint32 {
 	t.Helper()
 
 	rc, ok := ans.Find(diameter.AVPResultCode, 0)
@@ -498,7 +504,7 @@ func resultOf(t *testing.T, ans *diameter.Message) uint32 {
 	return v
 }
 
-func mustTBCD(t *testing.T, digits string) []byte {
+func mustTBCD(t testing.TB, digits string) []byte {
 	t.Helper()
 
 	b, err := tbcd.Encode(digits)
@@ -509,7 +515,7 @@ func mustTBCD(t *testing.T, digits string) []byte {
 	return b
 }
 
-func semiOctets(t *testing.T, digits string) []byte {
+func semiOctets(t testing.TB, digits string) []byte {
 	t.Helper()
 
 	out := []byte{byte(len(digits)), 0x91}
@@ -517,7 +523,7 @@ func semiOctets(t *testing.T, digits string) []byte {
 	return append(out, mustTBCD(t, digits)...)
 }
 
-func smsSubmit(t *testing.T, to, text string) []byte {
+func smsSubmit(t testing.TB, to, text string) []byte {
 	t.Helper()
 
 	out := []byte{0x01, 0x00}
@@ -527,7 +533,7 @@ func smsSubmit(t *testing.T, to, text string) []byte {
 	return append(out, text...)
 }
 
-func eventually(t *testing.T, what string, cond func() bool) {
+func eventually(t testing.TB, what string, cond func() bool) {
 	t.Helper()
 
 	deadline := time.Now().Add(waitTimeout)
@@ -553,7 +559,7 @@ type smscConfig struct {
 	AttemptTimeout time.Duration
 }
 
-func testConfig(t *testing.T, dbPath string) smscConfig {
+func testConfig(t testing.TB, dbPath string) smscConfig {
 	t.Helper()
 
 	return smscConfig{
@@ -575,7 +581,7 @@ func testConfig(t *testing.T, dbPath string) smscConfig {
 	}
 }
 
-func startSMSC(t *testing.T, cfg smscConfig) *smsc {
+func startSMSC(t testing.TB, cfg smscConfig) *smsc {
 	t.Helper()
 
 	store, err := db.Open(context.Background(), cfg.DB.Path)
@@ -989,7 +995,7 @@ func TestSettingsUpdateAppliesWithoutRestart(t *testing.T) {
 	}
 }
 
-func (s *smsc) api(t *testing.T, method, path string, body any, out any) int {
+func (s *smsc) api(t testing.TB, method, path string, body any, out any) int {
 	t.Helper()
 
 	var reader io.Reader
@@ -1230,5 +1236,112 @@ func TestAPIDiameterStatus(t *testing.T) {
 	if len(status.Peers) != 1 || status.Peers[0].Host != coreHost || status.Peers[0].State != "open" ||
 		status.Peers[0].Address != loopback.String() || !slices.Contains(status.Peers[0].Applications, "s6c") {
 		t.Fatalf("peers = %+v", status.Peers)
+	}
+}
+
+func TestTransientFailureKeepsTheRecipientsOrder(t *testing.T) {
+	core, s := newSMSC(t, alice, bob)
+
+	release := make(chan struct{})
+
+	var first atomic.Bool
+
+	first.Store(true)
+
+	core.setAnswerMT(func(string) *diameter.Message {
+		if !first.CompareAndSwap(true, false) {
+			return nil
+		}
+
+		<-release
+
+		return &diameter.Message{AVPs: []diameter.AVP{
+			diameter.UTF8String(diameter.AVPOriginHost, diameter.AVPFlagMandatory, 0, coreHost),
+			diameter.UTF8String(diameter.AVPOriginRealm, diameter.AVPFlagMandatory, 0, realm),
+			diameter.Unsigned32(diameter.AVPResultCode, diameter.AVPFlagMandatory, 0, diameter.ResultTooBusy),
+			authSessionState(),
+		}}
+	})
+
+	core.submit(alice, bob, "part one")
+
+	eventually(t, "delivery of part one to start", func() bool { return len(core.routingRequests()) == 1 })
+
+	core.submit(alice, bob, "part two")
+	close(release)
+
+	eventually(t, "part one to be rescheduled", func() bool {
+		m, err := s.store.GetMessage(context.Background(), 1)
+		return err == nil && m.Retries == 1
+	})
+
+	time.Sleep(200 * time.Millisecond)
+
+	if got := core.deliveredTo(bob.imsi); len(got) != 0 {
+		t.Fatalf("delivered %d messages while part one waits for its retry; part two must not overtake it", len(got))
+	}
+
+	if m, err := s.store.GetMessage(context.Background(), 2); err != nil || m.Status != db.StatusPending || m.Retries != 0 {
+		t.Fatalf("part two = %+v, %v; want it pending behind part one, with its retries untouched", m, err)
+	}
+
+	if rc := core.alert(bob); rc != diameter.ResultSuccess {
+		t.Fatalf("ALA result = %d", rc)
+	}
+
+	s.waitForStatus(t, 2, db.StatusDelivered)
+
+	got := core.deliveredTo(bob.imsi)
+	if len(got) != 2 || !bytes.HasSuffix(got[0].tpdu, []byte("part one")) || !bytes.HasSuffix(got[1].tpdu, []byte("part two")) {
+		t.Fatalf("delivered = %+v; want part one, then part two", got)
+	}
+}
+
+func TestHeldMessagesFollowInOneSession(t *testing.T) {
+	core, s := newSMSC(t, alice, bob)
+	core.setAbsent(bob.msisdn, true)
+
+	texts := []string{"one", "two", "three"}
+
+	for _, text := range texts {
+		core.submit(alice, bob, text)
+	}
+
+	eventually(t, "the recipient to be held", func() bool {
+		_, waiting, err := s.store.CountPending(context.Background(), time.Now())
+		return err == nil && waiting == len(texts)
+	})
+
+	core.setAbsent(bob.msisdn, false)
+
+	if rc := core.alert(bob); rc != diameter.ResultSuccess {
+		t.Fatalf("ALA result = %d", rc)
+	}
+
+	s.waitForStatus(t, int64(len(texts)), db.StatusDelivered)
+
+	if routings := core.routingRequests(); len(routings) != 2 {
+		t.Fatalf("routing requests = %v; want one before the alert and one for the whole queue after it", routings)
+	}
+
+	got := core.deliveredTo(bob.imsi)
+	if len(got) != len(texts) {
+		t.Fatalf("delivered %d messages", len(got))
+	}
+
+	var stamps [][]byte
+
+	for i, m := range got {
+		// TP-MMS is 0 when more messages wait.
+		if more := m.tpdu[0]&0x04 == 0; !bytes.HasSuffix(m.tpdu, []byte(texts[i])) || more != (i < len(texts)-1) {
+			t.Fatalf("message %d = %x; want %q, announcing more messages unless last", i+1, m.tpdu, texts[i])
+		}
+
+		stamp := m.tpdu[2+len(mustTBCD(t, alice.msisdn))+2:][:7]
+		if slices.ContainsFunc(stamps, func(b []byte) bool { return bytes.Equal(b, stamp) }) {
+			t.Fatalf("message %d repeats the time stamp %x; TS 23.040 clause 6.2 requires them to differ", i+1, stamp)
+		}
+
+		stamps = append(stamps, stamp)
 	}
 }
