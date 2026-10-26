@@ -10,12 +10,20 @@ import (
 )
 
 type metrics struct {
-	duration prometheus.Histogram
-	errors   prometheus.Counter
+	duration  prometheus.Histogram
+	errors    prometheus.Counter
+	completed *prometheus.CounterVec
+}
+
+// finalStatuses are the statuses that each kind of message ends with. Only a short message is replaced.
+var finalStatuses = map[MessageKind][]MessageStatus{
+	KindMessage:      {StatusDelivered, StatusFailed, StatusExpired, StatusReplaced},
+	KindStatusReport: {StatusDelivered, StatusFailed, StatusExpired},
 }
 
 func newMetrics() metrics {
 	return metrics{
+		completed: newCompleted(),
 		duration: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name: "ellasmsc_database_query_duration_seconds",
 			Help: "Duration of database calls, the wait for the connection, statements, transaction and row scanning included.",
@@ -29,6 +37,37 @@ func newMetrics() metrics {
 			Name: "ellasmsc_database_query_errors_total",
 			Help: "Database calls that failed. A record not found or a duplicate message is a result, not a failure.",
 		}),
+	}
+}
+
+// newCompleted returns the count of the messages that reached a final status, which the database counts once the
+// transaction that stores the status commits.
+func newCompleted() *prometheus.CounterVec {
+	completed := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "ellasmsc_messages_completed_total",
+		Help: "Short messages and status reports that reached a final status, by type (message, status_report) and " +
+			"status (delivered, failed, expired, and replaced for a message).",
+	}, []string{"type", "status"})
+
+	for kind, statuses := range finalStatuses {
+		for _, status := range statuses {
+			completed.WithLabelValues(string(kind), string(status))
+		}
+	}
+
+	return completed
+}
+
+// completion is a final status that a transaction stores, which the metrics count once it commits.
+type completion struct {
+	kind   MessageKind
+	status MessageStatus
+}
+
+// count counts the final statuses that a transaction stored, once it committed.
+func (m metrics) count(completed []completion) {
+	for _, done := range completed {
+		m.completed.WithLabelValues(string(done.kind), string(done.status)).Inc()
 	}
 }
 
@@ -51,10 +90,12 @@ func failed(err error) bool {
 	return err != nil && !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrDuplicate)
 }
 
-// Collectors are the metrics of the database: its calls and its size on disk. A call's duration includes the wait
-// for the connection, which every call shares.
+// Collectors are the metrics of the database: its calls, its size on disk, and what the messages it stores become. A
+// call's duration includes the wait for the connection, which every call shares.
 func (d *DB) Collectors() []prometheus.Collector {
-	return []prometheus.Collector{d.metrics.duration, d.metrics.errors, storageCollector{path: d.path}}
+	return []prometheus.Collector{
+		d.metrics.duration, d.metrics.errors, storageCollector{path: d.path}, d.metrics.completed,
+	}
 }
 
 var storageDesc = prometheus.NewDesc(

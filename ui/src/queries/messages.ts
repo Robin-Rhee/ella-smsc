@@ -5,7 +5,27 @@ import {
   type PageParams,
 } from "@/queries/utils";
 
-export type MessageStatus = "pending" | "delivered" | "failed" | "expired";
+export type MessageStatus =
+  "pending" | "delivered" | "failed" | "expired" | "replaced";
+
+// A status report is delivered as a message is, but is never replaced.
+export type StatusReportDelivery = Exclude<MessageStatus, "replaced">;
+
+export interface StatusReport {
+  id: number;
+  tp_status: number;
+  tp_status_name: string;
+  status: StatusReportDelivery;
+  created_at: string;
+  updated_at: string;
+  expires_at: string;
+  next_attempt_at?: string;
+}
+
+export interface StatusReports {
+  requested: boolean;
+  reports: StatusReport[];
+}
 
 export type MessageEncoding = "gsm7" | "ucs2" | "binary";
 
@@ -27,6 +47,7 @@ export interface Message {
   updated_at: string;
   expires_at: string;
   next_attempt_at?: string;
+  status_report: StatusReports;
 }
 
 export type AttemptStep = "routing" | "delivery";

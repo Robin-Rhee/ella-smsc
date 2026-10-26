@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"math/rand/v2"
@@ -45,6 +46,26 @@ type Message struct {
 	UpdatedAt     string         `json:"updated_at"`
 	ExpiresAt     string         `json:"expires_at"`
 	NextAttemptAt string         `json:"next_attempt_at,omitempty"`
+	StatusReport  StatusReports  `json:"status_report"`
+}
+
+// StatusReports are whether the originator of a message asked for status reports, and the reports that the SC returned
+// to it (TS 23.040 clause 3.2.9). Only a phone asks for status reports.
+type StatusReports struct {
+	Requested bool           `json:"requested"`
+	Reports   []StatusReport `json:"reports"`
+}
+
+// StatusReport is an SMS-STATUS-REPORT, with the TP-Status that it tells the originator, and the state of its delivery.
+type StatusReport struct {
+	ID            int64  `json:"id"`
+	TPStatus      uint8  `json:"tp_status"`
+	TPStatusName  string `json:"tp_status_name"`
+	Status        string `json:"status"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+	ExpiresAt     string `json:"expires_at"`
+	NextAttemptAt string `json:"next_attempt_at,omitempty"`
 }
 
 type Attempt struct {
@@ -175,7 +196,7 @@ func CreateMessage(cfg Config) http.Handler {
 		cfg.Received.Add(intake.OriginAPI, intake.Accepted, len(ids))
 		cfg.Notify()
 
-		resp := CreateMessageResponse{Items: make([]Message, 0, len(ids))}
+		stored := make([]db.Message, 0, len(ids))
 
 		for _, id := range ids {
 			m, err := cfg.Store.GetMessage(r.Context(), id)
@@ -184,10 +205,16 @@ func CreateMessage(cfg Config) http.Handler {
 				return
 			}
 
-			resp.Items = append(resp.Items, messageOf(m))
+			stored = append(stored, m)
 		}
 
-		writeResponse(w, resp, http.StatusCreated, cfg.Logger)
+		items, err := messagesOf(r.Context(), cfg, stored)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to retrieve message", err, cfg.Logger)
+			return
+		}
+
+		writeResponse(w, CreateMessageResponse{Items: items}, http.StatusCreated, cfg.Logger)
 	})
 }
 
@@ -198,7 +225,13 @@ func GetMessage(cfg Config) http.Handler {
 			return
 		}
 
-		writeResponse(w, messageOf(m), http.StatusOK, cfg.Logger)
+		items, err := messagesOf(r.Context(), cfg, []db.Message{m})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to retrieve message", err, cfg.Logger)
+			return
+		}
+
+		writeResponse(w, items[0], http.StatusOK, cfg.Logger)
 	})
 }
 
@@ -230,6 +263,8 @@ func ListMessageAttempts(cfg Config) http.Handler {
 	})
 }
 
+// lookupMessage returns the short message of the request. A status report is not one: it is under the message it is
+// on.
 func lookupMessage(w http.ResponseWriter, r *http.Request, cfg Config) (db.Message, bool) {
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
@@ -238,7 +273,7 @@ func lookupMessage(w http.ResponseWriter, r *http.Request, cfg Config) (db.Messa
 	}
 
 	m, err := cfg.Store.GetMessage(r.Context(), id)
-	if errors.Is(err, db.ErrNotFound) {
+	if errors.Is(err, db.ErrNotFound) || err == nil && m.Kind != db.KindMessage {
 		writeError(w, http.StatusNotFound, "Message not found", err, cfg.Logger)
 		return db.Message{}, false
 	}
@@ -314,10 +349,12 @@ func ListMessages(cfg Config) http.Handler {
 
 		if status := db.MessageStatus(q.Get("status")); status != "" {
 			switch status {
-			case db.StatusPending, db.StatusDelivered, db.StatusFailed, db.StatusExpired:
+			case db.StatusPending, db.StatusDelivered, db.StatusFailed, db.StatusExpired, db.StatusReplaced:
 				filter.Status = status
 			default:
-				writeError(w, http.StatusBadRequest, "status must be one of pending, delivered, failed, expired", nil, cfg.Logger)
+				writeError(w, http.StatusBadRequest, "status must be one of pending, delivered, failed, expired, replaced", nil,
+					cfg.Logger)
+
 				return
 			}
 		}
@@ -328,17 +365,38 @@ func ListMessages(cfg Config) http.Handler {
 			return
 		}
 
-		resp := ListMessagesResponse{Items: make([]Message, 0, len(messages)), Page: page, PerPage: perPage, TotalCount: total}
-
-		for _, m := range messages {
-			resp.Items = append(resp.Items, messageOf(m))
+		items, err := messagesOf(r.Context(), cfg, messages)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to list messages", err, cfg.Logger)
+			return
 		}
 
-		writeResponse(w, resp, http.StatusOK, cfg.Logger)
+		writeResponse(w, ListMessagesResponse{Items: items, Page: page, PerPage: perPage, TotalCount: total}, http.StatusOK,
+			cfg.Logger)
 	})
 }
 
-func messageOf(m db.Message) Message {
+// messagesOf returns the messages, each with the status reports on it.
+func messagesOf(ctx context.Context, cfg Config, messages []db.Message) ([]Message, error) {
+	ids := make([]int64, 0, len(messages))
+	for _, m := range messages {
+		ids = append(ids, m.ID)
+	}
+
+	reports, err := cfg.Store.StatusReportsFor(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]Message, 0, len(messages))
+	for _, m := range messages {
+		out = append(out, messageOf(m, reports[m.ID]))
+	}
+
+	return out, nil
+}
+
+func messageOf(m db.Message, reports []db.Message) Message {
 	out := Message{
 		ID:        m.ID,
 		From:      formatAddress(m.Originator),
@@ -354,10 +412,19 @@ func messageOf(m db.Message) Message {
 		out.NextAttemptAt = formatTime(m.NextAttemptAt)
 	}
 
+	out.StatusReport = StatusReports{Reports: make([]StatusReport, 0, len(reports))}
+
+	for _, r := range reports {
+		out.StatusReport.Reports = append(out.StatusReport.Reports, statusReportOf(r))
+	}
+
 	submit, err := tpdu.DecodeSubmit(m.TPDU)
 	if err != nil {
 		return out
 	}
+
+	// Only a phone asks for status reports; the API never does.
+	out.StatusReport.Requested = m.Origin == db.OriginMobile && submit.StatusReportRequest
 
 	content, err := submit.Content()
 	if err != nil {
@@ -372,6 +439,26 @@ func messageOf(m db.Message) Message {
 
 	if c := content.Concatenation; c != nil {
 		out.Concatenation = &Concatenation{Reference: c.Reference, Part: c.Part, Total: c.Total}
+	}
+
+	return out
+}
+
+func statusReportOf(r db.Message) StatusReport {
+	status := tpdu.Status(r.ReportStatus)
+
+	out := StatusReport{
+		ID:           r.ID,
+		TPStatus:     r.ReportStatus,
+		TPStatusName: status.String(),
+		Status:       string(r.Status),
+		CreatedAt:    formatTime(r.SubmittedAt),
+		UpdatedAt:    formatTime(r.UpdatedAt),
+		ExpiresAt:    formatTime(r.ExpiresAt),
+	}
+
+	if r.Status == db.StatusPending {
+		out.NextAttemptAt = formatTime(r.NextAttemptAt)
 	}
 
 	return out

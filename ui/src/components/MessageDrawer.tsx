@@ -20,6 +20,7 @@ import {
   getMessage,
   listMessageAttempts,
   type Message,
+  type StatusReport,
 } from "@/queries/messages";
 import { formatTimestamp } from "@/utils/dates";
 import {
@@ -29,6 +30,7 @@ import {
   nodeTypeLabels,
   partLabel,
   stepLabels,
+  tpStatusLabel,
 } from "@/utils/labels";
 
 export const DETAIL_REFRESH_MS = 5000;
@@ -159,6 +161,68 @@ function Attempts({ message }: { message: Message }) {
   );
 }
 
+function StatusReportCard({ report }: { report: StatusReport }) {
+  const rows: [string, ReactNode][] = [
+    ["Created", formatTimestamp(report.created_at)],
+    ["Updated", formatTimestamp(report.updated_at)],
+  ];
+  if (report.next_attempt_at) {
+    rows.push(["Next attempt", formatTimestamp(report.next_attempt_at)]);
+  }
+
+  return (
+    <Paper component="li" variant="outlined" sx={{ p: 1.5 }}>
+      <Stack direction="row" spacing={1} sx={{ alignItems: "center", mb: 1 }}>
+        <Typography variant="subtitle2" component="h4">
+          {tpStatusLabel(report)}
+        </Typography>
+        <MessageStatusChip status={report.status} />
+      </Stack>
+      <Fields rows={rows} />
+    </Paper>
+  );
+}
+
+// StatusReports shows whether the phone that sent the message asked for status reports, and those the SMSC returned
+// to it (TS 23.040 clause 3.2.9).
+function StatusReports({ message }: { message: Message }) {
+  const { requested, reports } = message.status_report;
+
+  return (
+    <Box component="section" aria-labelledby="status-reports-title">
+      <Typography
+        id="status-reports-title"
+        variant="subtitle1"
+        component="h3"
+        sx={{ mb: 1 }}
+      >
+        Status reports{reports.length > 0 ? ` (${reports.length})` : ""}
+      </Typography>
+      {reports.length === 0 && (
+        <Typography color="text.secondary">
+          {requested ? "None yet." : "Not requested."}
+        </Typography>
+      )}
+      {reports.length > 0 && (
+        <Stack
+          component="ol"
+          spacing={1}
+          sx={{ listStyle: "none", p: 0, m: 0 }}
+        >
+          {reports.map((r) => (
+            <StatusReportCard key={r.id} report={r} />
+          ))}
+        </Stack>
+      )}
+    </Box>
+  );
+}
+
+// inProgress tells whether the message, or a status report on it, still waits for delivery.
+export const inProgress = (m: Message): boolean =>
+  m.status === "pending" ||
+  m.status_report.reports.some((r) => r.status === "pending");
+
 function MessageDetail({
   initial,
   onClose,
@@ -171,9 +235,7 @@ function MessageDetail({
     queryFn: () => getMessage(initial.id),
     placeholderData: initial,
     refetchInterval: (q) =>
-      (q.state.data ?? initial).status === "pending"
-        ? DETAIL_REFRESH_MS
-        : false,
+      inProgress(q.state.data ?? initial) ? DETAIL_REFRESH_MS : false,
   });
 
   const message = data ?? initial;
@@ -233,6 +295,8 @@ function MessageDetail({
       </Paper>
       <Divider />
       <Attempts message={message} />
+      <Divider />
+      <StatusReports message={message} />
     </Stack>
   );
 }

@@ -329,7 +329,60 @@ components:
 
     MessageStatus:
       type: string
-      enum: [pending, delivered, failed, expired]
+      description: >-
+        replaced: a later message from the same phone, with the same replace type (TS 23.040 clause 9.2.3.9),
+        replaced it before its delivery.
+      enum: [pending, delivered, failed, expired, replaced]
+
+    StatusReports:
+      type: object
+      description: >-
+        Whether the phone that sent the message asked for status reports (TP-SRR), and the SMS-STATUS-REPORTs the
+        SMSC returned to it (TS 23.040 clause 3.2.9). A message submitted through the API never asks for reports.
+      required: [requested, reports]
+      properties:
+        requested:
+          type: boolean
+        reports:
+          type: array
+          description: Oldest first.
+          items:
+            $ref: "#/components/schemas/StatusReport"
+
+    StatusReport:
+      type: object
+      required: [id, tp_status, tp_status_name, status, created_at, updated_at, expires_at]
+      properties:
+        id:
+          type: integer
+          format: int64
+        tp_status:
+          type: integer
+          minimum: 0
+          maximum: 255
+          description: The TP-Status that the report tells (TS 23.040 clause 9.2.3.15).
+        tp_status_name:
+          type: string
+          description: >-
+            The meaning of tp_status in TS 23.040 clause 9.2.3.15; reserved and sc_specific for values the
+            specification does not name.
+          examples: [received, replaced, no_response, validity_period_expired]
+        status:
+          type: string
+          description: The delivery of the report to the phone.
+          enum: [pending, delivered, failed, expired]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        next_attempt_at:
+          type: string
+          format: date-time
 
     CreateMessageParams:
       type: object
@@ -401,7 +454,7 @@ components:
 
     Message:
       type: object
-      required: [id, from, to, encoding, status, created_at, updated_at, expires_at]
+      required: [id, from, to, encoding, status, created_at, updated_at, expires_at, status_report]
       properties:
         id:
           type: integer
@@ -431,6 +484,8 @@ components:
         next_attempt_at:
           type: string
           format: date-time
+        status_report:
+          $ref: "#/components/schemas/StatusReports"
 
     Attempt:
       type: object
