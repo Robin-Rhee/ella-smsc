@@ -2,13 +2,28 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import App from "@/App";
+import { RoleID } from "@/queries/users";
+import { makeToken } from "@/test/jwt";
 import { json, renderWithClient, stubApi } from "@/test/render";
 
-const serve = () =>
+// serve answers as an SMSC with a session of a user of role, until a logout, or without a session when role is
+// null.
+const serve = (role: RoleID | null = RoleID.Admin) => {
+  let session = role;
   vi.stubGlobal(
     "fetch",
     vi.fn(
       stubApi({
+        "/api/v1/auth/refresh": () =>
+          session === null
+            ? json(401, { error: "No valid session" })
+            : json(200, {
+                result: { token: makeToken("user@example.com", session) },
+              }),
+        "/api/v1/auth/logout": () => {
+          session = null;
+          return new Response(null, { status: 204 });
+        },
         "/api/v1/diameter": () =>
           json(200, {
             result: {
@@ -39,7 +54,9 @@ const serve = () =>
             },
           }),
         "/api/v1/status": () =>
-          json(200, { result: { version: "v0.0.1", revision: "" } }),
+          json(200, {
+            result: { version: "v0.0.1", revision: "", initialized: true },
+          }),
         "/api/v1/messages": () =>
           json(200, {
             result: { items: [], page: 1, per_page: 25, total_count: 0 },
@@ -47,6 +64,7 @@ const serve = () =>
       }),
     ),
   );
+};
 
 const renderAt = (path: string) =>
   renderWithClient(
@@ -62,10 +80,10 @@ afterEach(() => {
 describe("App", () => {
   it("renders the top bar, the navigation and the footer", async () => {
     serve();
-    renderAt("/cores");
+    renderAt("/diameter");
 
     expect(
-      screen.getByRole("img", { name: "Ella SMSC Logo" }),
+      await screen.findByRole("img", { name: "Ella SMSC Logo" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("banner")).toHaveTextContent("Ella SMSC");
     expect(
@@ -77,13 +95,19 @@ describe("App", () => {
         .map((link) => [link.textContent, link.getAttribute("href")]),
     ).toEqual([
       ["Operator", "/operator"],
-      ["Cores", "/cores"],
+      ["Diameter", "/diameter"],
       ["Messages", "/messages"],
+      ["Users", "/users"],
     ]);
+    expect(
+      within(screen.getByRole("navigation", { name: "Main" })).getByText(
+        "System",
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByRole("contentinfo")).toBeInTheDocument();
 
     const docs = screen.getByRole("link", { name: "Documentation" });
-    expect(docs).toHaveAttribute("href", "https://docs.ellanetworks.com");
+    expect(docs).toHaveAttribute("href", "https://docs.ellanetworks.com/smsc/");
     expect(docs).toHaveAttribute("target", "_blank");
 
     const bug = screen.getByRole("link", { name: "Report a bug" });
@@ -94,25 +118,25 @@ describe("App", () => {
     expect(bug).toHaveAttribute("target", "_blank");
   });
 
-  it("opens the Cores page by default", async () => {
+  it("opens the Diameter page by default", async () => {
     serve();
     renderAt("/");
 
     expect(
-      await screen.findByRole("heading", { level: 1, name: "Cores" }),
+      await screen.findByRole("heading", { level: 1, name: "Diameter" }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Cores" })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Diameter" })).toHaveAttribute(
       "aria-current",
       "page",
     );
-    expect(document.title).toBe("Cores · Ella SMSC");
+    expect(document.title).toBe("Diameter · Ella SMSC");
   });
 
   it("navigates between pages", async () => {
     serve();
-    renderAt("/cores");
+    renderAt("/diameter");
 
-    fireEvent.click(screen.getByRole("link", { name: "Operator" }));
+    fireEvent.click(await screen.findByRole("link", { name: "Operator" }));
     expect(
       await screen.findByRole("heading", { level: 1, name: "Operator" }),
     ).toBeInTheDocument();
@@ -126,5 +150,80 @@ describe("App", () => {
       "aria-current",
       "page",
     );
+  });
+
+  it("goes to the login page without a session", async () => {
+    serve(null);
+    renderAt("/messages");
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Login" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a Submitter only the Messages page", async () => {
+    serve(RoleID.Submitter);
+    renderAt("/diameter");
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Messages" }),
+    ).toBeInTheDocument();
+    expect(
+      within(screen.getByRole("navigation", { name: "Main" }))
+        .getAllByRole("link")
+        .map((link) => link.textContent),
+    ).toEqual(["Messages"]);
+    expect(screen.queryByText("System")).not.toBeInTheDocument();
+  });
+
+  it("logs out from the account menu", async () => {
+    serve();
+    renderAt("/diameter");
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Account menu" }),
+    );
+    expect(screen.getByText("user@example.com")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Log Out" }));
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Login" }),
+    ).toBeInTheDocument();
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.some(([input]) => String(input) === "/api/v1/auth/logout"),
+    ).toBe(true);
+  });
+
+  it("does not refresh the session on navigation", async () => {
+    serve();
+    renderAt("/diameter");
+
+    fireEvent.click(await screen.findByRole("link", { name: "Operator" }));
+    await screen.findByRole("heading", { level: 1, name: "Operator" });
+    const refreshes = () =>
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(
+          ([input]) => String(input) === "/api/v1/auth/refresh",
+        ).length;
+    const started = refreshes();
+
+    fireEvent.click(screen.getByRole("link", { name: "Messages" }));
+    await screen.findByRole("heading", { level: 1, name: "Messages" });
+    fireEvent.click(screen.getByRole("link", { name: "Users" }));
+    await screen.findByRole("heading", { level: 1, name: /^Users/ });
+
+    expect(refreshes()).toBe(started);
+  });
+
+  it("redirects the former Cores page", async () => {
+    serve();
+    renderAt("/cores");
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Diameter" }),
+    ).toBeInTheDocument();
   });
 });
