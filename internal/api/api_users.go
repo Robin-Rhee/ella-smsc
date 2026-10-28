@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -112,7 +113,7 @@ func UpdateMyPassword(a *auth) http.Handler {
 
 		// Not 401, which tells the UI that its session is over.
 		if !ok {
-			a.failures.allow(account)
+			a.failures.Allow(account)
 			writeError(w, http.StatusBadRequest, "Current password is incorrect", nil, cfg.Logger)
 
 			return
@@ -287,6 +288,11 @@ func UpdateUser(a *auth) http.Handler {
 			return
 		}
 
+		// The user's ESMEs bind again, under the checks of the new role.
+		if err := cfg.SMPP.CloseUser(r.Context(), u.ID); err != nil {
+			cfg.Logger.Error("failed to close the SMPP sessions of a user", slog.String("email", u.Email), slog.Any("error", err))
+		}
+
 		a.audit(r, "update_user", p.Email, fmt.Sprintf("Role of %s set to %d", u.Email, params.RoleID))
 		writeResponse(w, SuccessResponse{Message: "User updated successfully"}, http.StatusOK, cfg.Logger)
 	})
@@ -337,7 +343,14 @@ func DeleteUser(a *auth) http.Handler {
 			return
 		}
 
-		err := cfg.Auth.DeleteUser(r.Context(), u.ID)
+		// Deleting the user deletes its ESMEs, so they are listed before, to close their sessions after.
+		esmes, err := cfg.ESMEs.ListESMEsOfUser(r.Context(), u.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "Failed to delete user", err, cfg.Logger)
+			return
+		}
+
+		err = cfg.Auth.DeleteUser(r.Context(), u.ID)
 		if errors.Is(err, db.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "User not found", nil, cfg.Logger)
 			return
@@ -346,6 +359,10 @@ func DeleteUser(a *auth) http.Handler {
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "Failed to delete user", err, cfg.Logger)
 			return
+		}
+
+		for _, e := range esmes {
+			cfg.SMPP.CloseESME(e.ID)
 		}
 
 		a.audit(r, "delete_user", p.Email, "User "+u.Email+" deleted")

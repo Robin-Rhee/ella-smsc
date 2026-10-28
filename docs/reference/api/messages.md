@@ -4,7 +4,7 @@ description: RESTful API reference for submitting and viewing short messages in 
 
 # Messages
 
-A message is a short message the SMSC received, from a phone or from the API, with its delivery status and the status reports the SMSC returned to the phone that sent it. A text longer than one short message is split into parts, one message each.
+A message is a short message the SMSC received, from a phone, from the API, or from an ESME over [SMPP](../smpp.md), with its delivery status and the status reports the SMSC returned to the phone that sent it. A text longer than one short message is split into parts, one message each.
 
 Responses carry no content. [Get the content of a message](#get-the-content-of-a-message) returns it, and logs an audit event.
 
@@ -24,12 +24,13 @@ This path submits a text message, or a binary message, to a phone. It returns on
 | `to`   | string | Yes      | E.164 number with `+` of the recipient. |
 | `text` | string | One of `text` and `binary` | Not empty. GSM-7 if every character is in the GSM 7-bit default alphabet or its extension table, else UCS-2. Up to 255 parts. |
 | `binary` | object | One of `text` and `binary` | TPDU parameters of one short message, delivered unchanged. |
-| `binary.protocol_identifier` | int | No | TP-PID (TS 23.040 §9.2.3.9), `0` to `255`. Default `0`. Not `32` to `62`, telematic interworking. `65` to `71`, replace types 1 to 7, replace the pending message of the same type from the same `from`. `72`, device triggering, needs an application port addressing information element in `user_data_header`. |
+| `binary.protocol_identifier` | int | No | TP-PID (TS 23.040 §9.2.3.9), `0` to `255`. Default `0`. Not `32` to `62`, telematic interworking. `65` to `71`, replace types 1 to 7, replace the pending message of the same type from the same `from`, submitted by the same user; never a message from a phone or an ESME. `72`, device triggering, needs an application port addressing information element in `user_data_header`. |
 | `binary.data_coding_scheme` | int | Yes | TP-DCS (TS 23.038 §4), `0` to `255`. Not a GSM 7-bit, UCS2 or reserved coding. Message class 2 when `protocol_identifier` is `124`, ANSI-136 R-DATA, or `127`, (U)SIM data download. |
 | `binary.user_data_header` | string | No | TP-UDH (TS 23.040 §9.2.3.24) in hexadecimal, its length octet included. |
 | `binary.user_data` | string | Yes | TP-UD after the header, in hexadecimal. May be empty. At most 140 octets with `user_data_header`. Not split into parts. |
+| `validity_seconds` | int | No | How long delivery is attempted, `1` to `315360000` (10 years). Default: the default validity of the [delivery settings](delivery.md). |
 
-A message from the API never asks for status reports, and is kept for the default validity of the [delivery settings](delivery.md).
+A message from the API never asks for status reports.
 
 ### Response Codes
 
@@ -113,7 +114,7 @@ This path returns the list of messages, most recent first. For a Submitter, only
 | Field                           | Type    | Description |
 | ------------------------------- | ------- | ----------- |
 | `id`                            | int     | Message identifier. |
-| `from`                          | string  | Sender: the MSISDN of the phone, an E.164 number with `+`, or the `from` of the API request. |
+| `from`                          | string  | Sender: the MSISDN of the phone, an E.164 number with `+`, the `from` of the API request, or the `source_addr` of the `submit_sm`, with `+` when international. |
 | `to`                            | string  | Recipient, an E.164 number with `+`. |
 | `encoding`                      | string  | `gsm7`, `ucs2` or `binary`. |
 | `concatenation`                 | object  | Present for a part of a longer message. |
@@ -136,7 +137,8 @@ This path returns the list of messages, most recent first. For a Submitter, only
 | `status_report.reports[].updated_at`     | string | Time of the last change. |
 | `status_report.reports[].expires_at`     | string | End of the report's validity period. |
 | `status_report.reports[].next_attempt_at` | string | Time of the next delivery attempt of the report. Present while `pending`. |
-| `submitted_by`                  | string  | Email of the user that sent the message over the API. Absent for a message from a phone. |
+| `submitted_by`                  | string  | Email of the user that sent the message over the API, or of the user of the ESME that sent it over SMPP. Absent for a message from a phone. |
+| `system_id`                     | string  | `system_id` of the [ESME](esmes.md) that sent the message over SMPP. Absent for other messages, and once the ESME is deleted. |
 
 ### Sample Response
 
