@@ -26,8 +26,10 @@ const (
 )
 
 const (
-	ieiConcat8  = 0x00
-	ieiConcat16 = 0x08
+	ieiConcat8           = 0x00
+	ieiApplicationPort8  = 0x04
+	ieiApplicationPort16 = 0x05
+	ieiConcat16          = 0x08
 )
 
 var ErrTextTooLong = errors.New("text needs more than 255 short messages")
@@ -235,10 +237,10 @@ func (s Submit) Content() (Content, error) {
 	}
 
 	switch {
-	case isSeptetCoded(s.DataCodingScheme):
+	case IsSeptetCoded(s.DataCodingScheme):
 		c.Encoding = EncodingGSM7
 		c.Text = decodeGSM7(s.UserData, len(header), int(s.UserDataLength))
-	case isUCS2(s.DataCodingScheme):
+	case IsUCS2(s.DataCodingScheme):
 		c.Encoding = EncodingUCS2
 		c.Text = decodeUCS2(s.UserData[len(header):])
 	default:
@@ -279,17 +281,11 @@ func decodeGSM7(ud []byte, headerOctets, udl int) string {
 	escaped := false
 
 	for i := headerSeptets; i < udl; i++ {
-		bit := i * 7
-		if bit/8 >= len(ud) {
+		if i*7/8 >= len(ud) {
 			break
 		}
 
-		s := ud[bit/8] >> (bit % 8)
-		if bit%8 > 1 && bit/8+1 < len(ud) {
-			s |= ud[bit/8+1] << (8 - bit%8)
-		}
-
-		s &= 0x7f
+		s := septetAt(ud, i)
 
 		switch {
 		case escaped && s == gsm7Escape:
@@ -312,6 +308,18 @@ func decodeGSM7(ud []byte, headerOctets, udl int) string {
 	}
 
 	return string(runes)
+}
+
+// septetAt returns septet i of user data packed as in TS 23.038 clause 6.1.2.1.1.
+func septetAt(ud []byte, i int) byte {
+	bit := i * 7
+
+	s := ud[bit/8] >> (bit % 8)
+	if bit%8 > 1 && bit/8+1 < len(ud) {
+		s |= ud[bit/8+1] << (8 - bit%8)
+	}
+
+	return s & 0x7f
 }
 
 func decodeUCS2(b []byte) string {

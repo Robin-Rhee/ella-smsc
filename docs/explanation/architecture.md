@@ -37,10 +37,14 @@ When no serving node takes a message, Ella SMSC makes sure the HSS records that 
 A message ends:
 
 - **delivered**, when a serving node takes it;
-- **failed**, when the recipient is unknown, not allowed SMS, or has no serving node that supports SGd, or when an attempt fails and the message is single-shot or retries are off;
+- **failed**, when the recipient is unknown, not allowed SMS, or has no serving node that supports SGd, when the SIM refuses a (U)SIM data download message, or when an attempt fails and the message is single-shot or retries are off;
 - **expired**, when its validity period ends first;
-- **replaced**, when a later message from the same phone replaces it.
+- **replaced**, when a later message from the same sender replaces it.
 
 ## Status reports
 
 When a phone asks for status reports, Ella SMSC returns one to it when the message ends. It delivers the report as it does a message.
+
+## Binary messages
+
+Applications can send binary messages, such as the (U)SIM data download messages that an OTA platform sends to update SIM cards: the phone passes them to the SIM instead of showing them. Ella SMSC delivers their parameters and user data unchanged, and keeps the phone's answer to each delivery attempt, which can carry the SIM's response.

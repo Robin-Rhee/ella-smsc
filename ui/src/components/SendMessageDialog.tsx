@@ -13,6 +13,7 @@ import DialogError from "@/components/DialogError";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { createMessage, type Message } from "@/queries/messages";
 import { isE164 } from "@/utils/e164";
+import { isOriginator } from "@/utils/originator";
 import { encodingLabels } from "@/utils/labels";
 import { segmentText } from "@/utils/sms";
 
@@ -25,10 +26,15 @@ interface SendMessageDialogProps {
 const pluralize = (n: number, word: string) =>
   `${n} ${word}${n === 1 ? "" : "s"}`;
 
-const numberError = (value: string, touched: boolean) => {
+const fieldError = (
+  value: string,
+  touched: boolean,
+  isValid: (value: string) => boolean,
+  hint: string,
+) => {
   if (!touched) return undefined;
   if (value === "") return "Required";
-  if (!isE164(value)) return "E.164, e.g. +15551230002";
+  if (!isValid(value)) return hint;
   return undefined;
 };
 
@@ -74,10 +80,25 @@ export default function SendMessageDialog({
     },
   });
 
-  const fromError = numberError(from, touched.from);
-  const toError = numberError(to, touched.to);
+  // The value is kept as typed, since a name may hold spaces, and trimmed of those around it to be used.
+  const sender = from.trim();
+  const fromError = fieldError(
+    sender,
+    touched.from,
+    isOriginator,
+    "E.164, e.g. +15551230001, or a name of up to 11 letters and digits, with single spaces",
+  );
+  const toError = fieldError(
+    to,
+    touched.to,
+    isE164,
+    "E.164, e.g. +15551230002",
+  );
   const valid =
-    isE164(from) && isE164(to) && text !== "" && !segmentText(text).tooLong;
+    isOriginator(sender) &&
+    isE164(to) &&
+    text !== "" &&
+    !segmentText(text).tooLong;
 
   const close = () => {
     mutation.reset();
@@ -87,7 +108,7 @@ export default function SendMessageDialog({
   const submit = (event: FormEvent) => {
     event.preventDefault();
     if (!valid || mutation.isPending) return;
-    mutation.mutate({ from, to, text });
+    mutation.mutate({ from: sender, to, text });
   };
 
   return (
@@ -108,7 +129,7 @@ export default function SendMessageDialog({
           <TextField
             label="From"
             value={from}
-            onChange={(e) => setFrom(e.target.value.trim())}
+            onChange={(e) => setFrom(e.target.value)}
             onBlur={() => setTouched((t) => ({ ...t, from: true }))}
             error={fromError !== undefined}
             helperText={fromError}

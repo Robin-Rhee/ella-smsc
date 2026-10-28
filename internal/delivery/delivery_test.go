@@ -308,9 +308,15 @@ func experimental(code uint32, extra ...diameter.AVP) *diameter.Message {
 	}, extra...)}
 }
 
-func smDeliveryFailure(cause sgd.DeliveryFailureCause) *diameter.Message {
+// smDeliveryFailure is an SM Delivery Failure answer, with the SMS-DELIVER-REPORT of the MS as diagnostic if any.
+func smDeliveryFailure(cause sgd.DeliveryFailureCause, diagnostic ...byte) *diameter.Message {
+	inner := []diameter.AVP{diameter.Unsigned32(sgd.AVPSMEnumeratedDeliveryFailureCause, diameter.AVPFlagMandatory, tgpp.VendorID, uint32(cause))}
+	if diagnostic != nil {
+		inner = append(inner, diameter.OctetString(sgd.AVPSMDiagnosticInfo, diameter.AVPFlagMandatory, tgpp.VendorID, diagnostic))
+	}
+
 	return experimental(tgpp.ResultErrorSMDeliveryFailure, diameter.Grouped(sgd.AVPSMDeliveryFailureCause, diameter.AVPFlagMandatory, tgpp.VendorID,
-		diameter.Unsigned32(sgd.AVPSMEnumeratedDeliveryFailureCause, diameter.AVPFlagMandatory, tgpp.VendorID, uint32(cause))))
+		inner...))
 }
 
 func mmeRouting() s6c.Routing {
@@ -437,7 +443,7 @@ func TestDeliverViaMME(t *testing.T) {
 	}
 
 	if a := store.attempts[1]; a.MessageID != 1 || !a.StartedAt.Equal(testNow) || !a.CompletedAt.Equal(testNow) ||
-		a.ResultCode == nil || *a.ResultCode != diameter.ResultSuccess || a.VendorID != nil {
+		a.ResultCode == nil || *a.ResultCode != diameter.ResultSuccess || a.VendorID != nil || a.DeliverReport != nil {
 		t.Fatalf("attempt = %+v", a)
 	}
 
@@ -473,6 +479,76 @@ func TestDeliverViaMME(t *testing.T) {
 
 	want := mustHex(t, "04"+"0b91"+"5155210300f1"+"00"+"00"+"62907211950000"+"05"+"e8329bfd06")
 	if got := avpData(t, tfr, sgd.AVPSMRPUI, tgpp.VendorID); !bytes.Equal(got, want) {
+		t.Fatalf("SMS-DELIVER = %x, want %x", got, want)
+	}
+}
+
+func TestDeliverRecordsDeliverReport(t *testing.T) {
+	report := mustHex(t, "00"+"07"+"7f"+"f6"+"02"+"cafe")
+	smRPUI := diameter.OctetString(sgd.AVPSMRPUI, diameter.AVPFlagMandatory, tgpp.VendorID, report)
+	failed := mustHex(t, "00"+"d5"+"07"+"7f"+"f6"+"02"+"cafe")
+
+	tests := map[string]struct {
+		answer        *diameter.Message
+		want          []byte
+		wantTPFailure string
+		wantStatus    db.MessageStatus
+	}{
+		"RP-ACK": {
+			answer: &diameter.Message{AVPs: append(success().AVPs, smRPUI)}, want: report, wantStatus: db.StatusDelivered,
+		},
+		"RP-ERROR": {
+			answer: smDeliveryFailure(sgd.CauseEquipmentProtocolError, failed...), want: failed,
+			wantTPFailure: "usim_data_download_error", wantStatus: db.StatusFailed,
+		},
+		"SM-RP-UI on a failure": {
+			answer:     experimental(tgpp.ResultErrorSMDeliveryFailure, smRPUI),
+			wantStatus: db.StatusPending,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := newFakeStore(pendingMessage(t))
+			sender := &fakeSender{answers: map[string]*diameter.Message{"mme.example.org": tt.answer}}
+
+			process(t, newDeliverer(store, &fakeRouter{routing: mmeRouting()}, sender))
+
+			if got := store.messages[1].Status; got != tt.wantStatus {
+				t.Fatalf("status = %s, want %s", got, tt.wantStatus)
+			}
+
+			a := store.attempts[1]
+			if a.Step != db.StepDelivery || !bytes.Equal(a.DeliverReport, tt.want) || (tt.want == nil) != (a.DeliverReport == nil) ||
+				a.TPFailureCause != tt.wantTPFailure {
+				t.Fatalf("attempt = %+v, want deliver report %x", a, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeliverAlphanumericOriginator(t *testing.T) {
+	m := pendingMessage(t)
+	m.Origin = db.OriginAPI
+	m.Originator = db.Address{Digits: "EllaSMSC", TypeOfNumber: 5, NumberingPlan: 0}
+	m.TPDU = mustHex(t, "01"+"00"+"0b91"+"5155210300f2"+"00"+"00"+"02"+"e834")
+
+	store := newFakeStore(m)
+	router := &fakeRouter{routing: mmeRouting()}
+	sender := &fakeSender{answers: map[string]*diameter.Message{"mme.example.org": success()}}
+
+	process(t, newDeliverer(store, router, sender))
+
+	if store.messages[1].Status != db.StatusDelivered {
+		t.Fatalf("status = %s", store.messages[1].Status)
+	}
+
+	if len(router.requests) != 1 || !bytes.Equal(router.requests[0].SMEA, mustHex(t, "0e"+"d0"+"45363b3c6d4e87")) {
+		t.Fatalf("routing requests = %+v", router.requests)
+	}
+
+	want := mustHex(t, "04"+"0ed045363b3c6d4e87"+"00"+"00"+"62907211950000"+"02"+"e834")
+	if got := avpData(t, sender.requests[0], sgd.AVPSMRPUI, tgpp.VendorID); !bytes.Equal(got, want) {
 		t.Fatalf("SMS-DELIVER = %x, want %x", got, want)
 	}
 }
@@ -637,6 +713,21 @@ func TestDeliverOutcomes(t *testing.T) {
 		"illegal equipment fails":             {answer: experimental(tgpp.ResultErrorIllegalEquipment), wantStatus: db.StatusFailed},
 		"equipment protocol error is retried": {answer: smDeliveryFailure(sgd.CauseEquipmentProtocolError), wantStatus: db.StatusPending, wantNext: testNow.Add(time.Minute)},
 		"not SM equipped is retried":          {answer: smDeliveryFailure(sgd.CauseEquipmentNotSMEquipped), wantStatus: db.StatusPending, wantNext: testNow.Add(time.Minute)},
+		"usim data download error fails": {
+			answer: smDeliveryFailure(sgd.CauseEquipmentProtocolError, 0x00, tpdu.FailureUSIMDataDownloadError, 0x00), wantStatus: db.StatusFailed,
+		},
+		"usim data download error with unused bits is retried": {
+			answer:     smDeliveryFailure(sgd.CauseEquipmentProtocolError, 0x84, tpdu.FailureUSIMDataDownloadError, 0x00),
+			wantStatus: db.StatusPending, wantNext: testNow.Add(time.Minute),
+		},
+		"usim toolkit busy is retried": {
+			answer:     smDeliveryFailure(sgd.CauseEquipmentProtocolError, 0x00, tpdu.FailureUSIMToolkitBusy, 0x00),
+			wantStatus: db.StatusPending, wantNext: testNow.Add(time.Minute),
+		},
+		"error in MS is retried": {
+			answer:     smDeliveryFailure(sgd.CauseEquipmentProtocolError, 0x00, 0xd2, 0x00),
+			wantStatus: db.StatusPending, wantNext: testNow.Add(time.Minute),
+		},
 	}
 
 	for name, tt := range tests {

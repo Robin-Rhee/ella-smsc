@@ -64,6 +64,72 @@ describe("SendMessageDialog", () => {
     );
   });
 
+  it("sends from a name, spaces included", async () => {
+    const bodies = servePost(() =>
+      json(201, { result: { items: [message()] } }),
+    );
+    const onSent = vi.fn();
+
+    renderWithClient(
+      <SendMessageDialog open onClose={() => {}} onSent={onSent} />,
+    );
+
+    fill("From", "EllaSMSC");
+    fill("To", "+15551230002");
+    fill("Text", "hello");
+    expect(sendButton()).toBeEnabled();
+
+    fill("From", "ACME Ltd");
+    expect(screen.getByRole("textbox", { name: "From" })).toHaveValue(
+      "ACME Ltd",
+    );
+    fireEvent.click(sendButton());
+
+    await waitFor(() => expect(onSent).toHaveBeenCalled());
+    expect(bodies).toEqual([
+      { from: "ACME Ltd", to: "+15551230002", text: "hello" },
+    ]);
+  });
+
+  it("sends a pasted sender without the spaces around it", async () => {
+    const bodies = servePost(() =>
+      json(201, { result: { items: [message()] } }),
+    );
+    const onSent = vi.fn();
+
+    renderWithClient(
+      <SendMessageDialog open onClose={() => {}} onSent={onSent} />,
+    );
+
+    fill("From", " +15551230001 ");
+    fill("To", "+15551230002");
+    fill("Text", "hello");
+    fireEvent.blur(screen.getByRole("textbox", { name: "From" }));
+    expect(screen.queryByText(/^E\.164/)).not.toBeInTheDocument();
+    fireEvent.click(sendButton());
+
+    await waitFor(() => expect(onSent).toHaveBeenCalled());
+    expect(bodies).toEqual([
+      { from: "+15551230001", to: "+15551230002", text: "hello" },
+    ]);
+  });
+
+  it("flags an invalid sender once the field is left", () => {
+    renderWithClient(
+      <SendMessageDialog open onClose={() => {}} onSent={() => {}} />,
+    );
+
+    const from = screen.getByRole("textbox", { name: "From" });
+    fireEvent.change(from, { target: { value: "EllaNetworks" } });
+    fireEvent.blur(from);
+    expect(
+      screen.getByText(
+        "E.164, e.g. +15551230001, or a name of up to 11 letters and digits, with single spaces",
+      ),
+    ).toBeInTheDocument();
+    expect(sendButton()).toBeDisabled();
+  });
+
   it("counts parts the way the server splits them", () => {
     renderWithClient(
       <SendMessageDialog open onClose={() => {}} onSent={() => {}} />,
