@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,8 @@ type Settings struct {
 	Operator  Operator
 	Delivery  Delivery
 	Retention Retention
+	// Peers are ordered by ID.
+	Peers []Peer
 }
 
 type Operator struct {
@@ -58,7 +61,13 @@ type Retention struct {
 const MinRetention = 24 * time.Hour
 
 func (s Settings) Validate() error {
-	return errors.Join(s.Operator.Validate(), s.Delivery.Validate(), s.Retention.Validate())
+	errs := []error{s.Operator.Validate(), s.Delivery.Validate(), s.Retention.Validate()}
+
+	for i, p := range s.Peers {
+		errs = append(errs, p.Validate(), p.conflict(s.Peers[:i], s.Operator.Host()))
+	}
+
+	return errors.Join(errs...)
 }
 
 func (o Operator) Validate() error {
@@ -108,6 +117,7 @@ type Store interface {
 	UpdateOperator(ctx context.Context, o Operator) error
 	UpdateDelivery(ctx context.Context, d Delivery) error
 	UpdateRetention(ctx context.Context, r Retention) error
+	PeerStore
 }
 
 // Live serves the current settings to the running SMSC and persists changes
@@ -124,6 +134,12 @@ func NewLive(store Store, initial Settings) *Live {
 	l := &Live{store: store, changed: make(chan struct{})}
 
 	initial.Delivery.RetryIntervals = slices.Clone(initial.Delivery.RetryIntervals)
+	initial.Peers = slices.Clone(initial.Peers)
+
+	for i, p := range initial.Peers {
+		initial.Peers[i] = clonePeer(p)
+	}
+
 	l.current.Store(&initial)
 
 	return l
@@ -134,12 +150,27 @@ func (l *Live) Get() Settings {
 	return *l.current.Load()
 }
 
+// UpdateOperator changes the operator, unless its new Diameter host is a configured peer's.
 func (l *Live) UpdateOperator(ctx context.Context, o Operator) error {
 	if err := o.Validate(); err != nil {
 		return err
 	}
 
-	return l.update(func() error { return l.store.UpdateOperator(ctx, o) }, func(s *Settings) { s.Operator = o })
+	return l.change(func(s *Settings) error {
+		for _, p := range s.Peers {
+			if strings.EqualFold(p.Host, o.Host()) {
+				return fmt.Errorf("%w: host %s is peer %d's", ErrConflict, o.Host(), p.ID)
+			}
+		}
+
+		if err := l.store.UpdateOperator(ctx, o); err != nil {
+			return fmt.Errorf("save settings: %w", err)
+		}
+
+		s.Operator = o
+
+		return nil
+	})
 }
 
 func (l *Live) UpdateDelivery(ctx context.Context, d Delivery) error {
@@ -161,15 +192,28 @@ func (l *Live) UpdateRetention(ctx context.Context, r Retention) error {
 }
 
 func (l *Live) update(save func() error, apply func(*Settings)) error {
+	return l.change(func(s *Settings) error {
+		if err := save(); err != nil {
+			return fmt.Errorf("save settings: %w", err)
+		}
+
+		apply(s)
+
+		return nil
+	})
+}
+
+// change applies fn to a copy of the current settings, which it must persist, and makes the copy current unless fn
+// fails. Changes are serialized, so fn sees the settings it replaces.
+func (l *Live) change(fn func(*Settings) error) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if err := save(); err != nil {
-		return fmt.Errorf("save settings: %w", err)
+	next := *l.current.Load()
+	if err := fn(&next); err != nil {
+		return err
 	}
 
-	next := *l.current.Load()
-	apply(&next)
 	l.current.Store(&next)
 
 	close(l.changed)

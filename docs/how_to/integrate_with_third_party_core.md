@@ -35,7 +35,7 @@ The **Diameter** page shows Ella SMSC's **Host** and **Realm**, e.g. `smsc.node.
 
 ## 3. Add Ella SMSC to the core
 
-Ella SMSC does not connect to its peers: each peer connects to it. In the HSS, and in each MME or SMSF, add Ella SMSC as a Diameter peer:
+In the HSS, and in each MME or SMSF, add Ella SMSC as a Diameter peer:
 
 - **Address**: `10.3.0.7`
 - **Port**: `3868`
