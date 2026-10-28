@@ -13,8 +13,7 @@ spec:
       labels:
         app: ella-smsc
     spec:
-      # The SMSC waits up to 35 s for in-flight deliveries when stopped.
-      terminationGracePeriodSeconds: 45
+      terminationGracePeriodSeconds: 50
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -39,15 +38,22 @@ spec:
         - name: diameter
           containerPort: 3868
           protocol: SCTP
+        startupProbe:
+          httpGet:
+            path: /api/v1/readyz
+            port: http
+          periodSeconds: 2
+          timeoutSeconds: 5
+          failureThreshold: 150
         readinessProbe:
           httpGet:
-            path: /api/v1/status
+            path: /api/v1/readyz
             port: http
           periodSeconds: 10
           timeoutSeconds: 5
         livenessProbe:
           httpGet:
-            path: /api/v1/status
+            path: /api/v1/livez
             port: http
           periodSeconds: 20
           timeoutSeconds: 5

@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ellanetworks/core/diameter"
@@ -37,14 +38,22 @@ type Server struct {
 	attemptTimeout time.Duration
 	// bcryptCost is the cost of the password hashes: bcrypt's default when zero.
 	bcryptCost int
+	// purgeNow and purgeInterval are the clock and the period of the message retention: time.Now and purgeInterval
+	// when zero.
+	purgeNow      func() time.Time
+	purgeInterval time.Duration
 
-	database      *db.DB
+	database *db.DB
+	// draining is set once Shutdown starts, and makes the API unready.
+	draining      atomic.Bool
 	nodes         *nodeManager
 	stopFollowing context.CancelFunc
 	apiServer     *http.Server
 	apiListener   net.Listener
 	stopDelivery  context.CancelFunc
 	deliveryDone  chan struct{}
+	stopPurging   context.CancelFunc
+	purgeDone     chan struct{}
 }
 
 func (s *Server) Start(ctx context.Context) error {
@@ -158,6 +167,7 @@ func (s *Server) Start(ctx context.Context) error {
 			Frontend:   ui.FS(),
 			Settings:   live,
 			Notify:     deliverer.Notify,
+			Ready:      func(ctx context.Context) error { return s.ready(ctx, database) },
 			Received:   m.received,
 			Metrics:    m.registry,
 			Auth:       database,
@@ -195,11 +205,32 @@ func (s *Server) Start(ctx context.Context) error {
 		close(deliveryDone)
 	}()
 
+	purgeCtx, stopPurging := context.WithCancel(base)
+	purgeDone := make(chan struct{})
+	p := &purger{
+		store:    database,
+		settings: live.Get,
+		interval: cmp.Or(s.purgeInterval, purgeInterval),
+		now:      s.purgeNow,
+		logger:   s.Logger,
+	}
+
+	if p.now == nil {
+		p.now = time.Now
+	}
+
+	go func() {
+		p.run(purgeCtx)
+		close(purgeDone)
+	}()
+
 	s.database = database
 	s.nodes = nodes
 	s.stopFollowing = stopFollowing
 	s.stopDelivery = stopDelivery
 	s.deliveryDone = deliveryDone
+	s.stopPurging = stopPurging
+	s.purgeDone = purgeDone
 
 	v := version.Get()
 
@@ -232,6 +263,17 @@ func (s *Server) Shutdown(ctx context.Context) {
 
 	s.Logger.Info("smsc stopping")
 
+	s.draining.Store(true)
+
+	if d := s.Config.API.DrainDelay; d > 0 {
+		s.Logger.Info("draining the API", slog.Duration("delay", d))
+
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+		}
+	}
+
 	s.stopFollowing()
 
 	if err := s.apiServer.Shutdown(ctx); err != nil {
@@ -239,6 +281,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 	}
 
 	s.stopDelivery()
+	s.stopPurging()
 
 	select {
 	case <-s.deliveryDone:
@@ -246,11 +289,27 @@ func (s *Server) Shutdown(ctx context.Context) {
 		s.Logger.Warn("shutting down with short message deliveries still in flight")
 	}
 
+	select {
+	case <-s.purgeDone:
+	case <-ctx.Done():
+	}
+
 	s.nodes.shutdown(ctx)
 
 	if err := s.database.Close(); err != nil {
 		s.Logger.Error("failed to close the database", slog.Any("error", err))
 	}
+}
+
+// ready is whether the API can serve: it is not once Shutdown starts, or while the database does not answer. The
+// Diameter peers do not count: the Diameter Service selects the same pods, so an SMSC unready without its peers
+// could not get them back.
+func (s *Server) ready(ctx context.Context, database *db.DB) error {
+	if s.draining.Load() {
+		return errors.New("shutting down")
+	}
+
+	return database.Ping(ctx)
 }
 
 type hssSender struct {

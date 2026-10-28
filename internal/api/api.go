@@ -40,6 +40,7 @@ type Settings interface {
 	Get() settings.Settings
 	UpdateOperator(ctx context.Context, o settings.Operator) error
 	UpdateDelivery(ctx context.Context, d settings.Delivery) error
+	UpdateRetention(ctx context.Context, r settings.Retention) error
 }
 
 type Config struct {
@@ -50,6 +51,9 @@ type Config struct {
 	Notify   func()
 	// Received counts the messages the API submits.
 	Received *intake.Received
+	// Ready reports why the SMSC cannot serve requests, or nil when it can. GET /api/v1/readyz answers 503 when
+	// it fails. Nil is always ready.
+	Ready func(ctx context.Context) error
 	// Metrics are the metrics GET /api/v1/metrics serves.
 	Metrics prometheus.Gatherer
 	// Auth stores the users, their sessions and their API tokens.
@@ -73,6 +77,8 @@ type route struct {
 
 func routes(cfg Config, a *auth) []route {
 	rs := []route{
+		{"GET /api/v1/livez", public, Livez()},
+		{"GET /api/v1/readyz", public, Readyz(cfg)},
 		{"GET /api/v1/status", public, GetStatus(cfg)},
 		{"GET /api/v1/metrics", public, GetMetrics(cfg)},
 		{"GET /api/v1/openapi.yaml", public, OpenAPISpec()},
@@ -83,7 +89,10 @@ func routes(cfg Config, a *auth) []route {
 
 		{"POST /api/v1/messages", PermCreateMessage, CreateMessage(cfg)},
 		{"GET /api/v1/messages", PermReadMessage, ListMessages(cfg)},
+		{"GET /api/v1/messages/retention", PermReadRetention, GetRetention(cfg)},
+		{"PUT /api/v1/messages/retention", PermUpdateRetention, UpdateRetention(cfg)},
 		{"GET /api/v1/messages/{id}", PermReadMessage, GetMessage(cfg)},
+		{"GET /api/v1/messages/{id}/content", PermReadMessageContent, GetMessageContent(cfg, a)},
 		{"GET /api/v1/messages/{id}/attempts", PermReadMessage, ListMessageAttempts(cfg)},
 		{"GET /api/v1/diameter", PermReadDiameter, GetDiameterStatus(cfg)},
 		{"GET /api/v1/operator", PermReadOperator, GetOperator(cfg)},
