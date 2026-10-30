@@ -4,7 +4,7 @@ description: Reference for observability features in Ella SMSC.
 
 # Observability
 
-Ella Core supports three observability pillars: Metrics, Logs, and Profiles.
+Ella SMSC supports four observability pillars: Metrics, Logs, Traces, and Profiles.
 
 ## Metrics
 
@@ -31,6 +31,33 @@ Ella SMSC exposes Prometheus metrics at [`GET /api/v1/metrics`](api/metrics.md).
 | `ellasmsc_database_storage_bytes` | Gauge | Size of the database on disk, by file: `main`, `wal`. |
 | `go_*` | Gauge, Counter, Summary | Go runtime: goroutines, heap, garbage-collection pauses. |
 | `process_*` | Gauge, Counter | Process: memory, CPU, open file descriptors, start time. |
+
+## Traces
+
+Ella SMSC exports [OpenTelemetry](https://opentelemetry.io/) traces when `telemetry.enabled` is set in the [configuration file](config_file.md).
+
+| Property | Value |
+| --- | --- |
+| Export | OTLP over gRPC, without TLS |
+| Sampling | Parent-based, always on for a trace the SMSC starts |
+| Propagation | W3C Trace Context |
+| Left out | MSISDN, IMSI, message content |
+
+### Spans
+
+| Span | Kind | Description | `error.type` |
+| --- | --- | --- | --- |
+| `{method} {route}` | Server | A request to the API, except `/api/v1/livez`, `/api/v1/readyz`, `/api/v1/metrics` and `/api/v1/pprof/`. Links to the caller's `traceparent`. | None. A 5xx response has the Error status. |
+| `submit_sm` | Server | A `submit_sm` from an ESME. | `ESME_RSYSERR`, `_OTHER` |
+| `deliver` | Consumer | A delivery attempt of a short message or status report. Root span, linked to the span that created the message. | `failed`, `expired`, `_OTHER` |
+| `deliver_sm` | Client | A delivery receipt or SIM answer to an ESME. Root span, linked to the span that created the message. | A `command_status` that SMPP 3.4 names, `session_closed`, `timeout`, `canceled`, `_OTHER` |
+| `S6c/{command}`, `SGd/{command}` | Server, Client | A Diameter request. Child of the peer's trace context. | Client: a Result-Code from 3000, `closed`, `not_connected`, `unknown_peer`, `application_unsupported`, `unable_to_deliver`, `loop_detected`, `not_proxiable`, `timeout`, `canceled`, `_OTHER`. Server: `3001`, `3002`, `3004`, `5012`, `overloaded`, `shutting_down`. |
+
+### Attributes
+
+| Attribute | Span | Values |
+| --- | --- | --- |
+| `ella.sms.delivery.outcome` | `deliver` | `delivered`, `failed`, `expired`, `replaced`, `retry`, `interrupted` |
 
 ## Profiles
 

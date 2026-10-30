@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/ellanetworks/smsc/internal/db"
+	"github.com/ellanetworks/smsc/internal/tracing"
 	"github.com/ellanetworks/smsc/smpp"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -211,7 +215,10 @@ func (s *Service) send(ctx context.Context, sess *Session, n db.Notification) {
 	conn := sess.conn
 	s.mu.Unlock()
 
-	status, err := conn.Deliver(ctx, d)
+	spanCtx, span := s.startSpan(ctx, trace.SpanKindClient, smpp.CmdDeliverSM, sess, tracing.Links(n.Message.TraceParent)...)
+	status, err := conn.Deliver(spanCtx, d)
+
+	endDeliverSpan(span, status, err)
 
 	var stateErr *smpp.StateError
 
@@ -256,4 +263,34 @@ func (s *Service) retry(ctx context.Context, log *slog.Logger, n db.Notification
 	if err := s.Store.RetryNotification(ctx, n.ID, s.Now().Add(retryDelay(n.Attempts))); err != nil {
 		log.Error("failed to schedule an SMPP notification again", slog.Any("error", err))
 	}
+}
+
+// endDeliverSpan ends the span of a deliver_sm: an error unless the ESME acknowledged it.
+func endDeliverSpan(span trace.Span, status smpp.CommandStatus, err error) {
+	var stateErr *smpp.StateError
+
+	switch {
+	case errors.Is(err, smpp.ErrClosed) || errors.As(err, &stateErr):
+		endSpan(span, nil, "session_closed", err)
+	case errors.Is(err, smpp.ErrResponseTimeout) || errors.Is(err, context.DeadlineExceeded):
+		endSpan(span, nil, "timeout", err)
+	case errors.Is(err, context.Canceled):
+		endSpan(span, nil, "canceled", err)
+	case err != nil:
+		endSpan(span, nil, semconv.ErrorTypeOther.Value.AsString(), err)
+	case status != smpp.StatusOK:
+		endSpan(span, &status, statusErrorType(status), nil)
+	default:
+		endSpan(span, &status, "", nil)
+	}
+}
+
+// statusErrorType is the error.type of a command_status: its name, or _OTHER for one that SMPP 3.4 does not name,
+// which an ESME chooses.
+func statusErrorType(status smpp.CommandStatus) string {
+	if name := status.String(); strings.HasPrefix(name, "ESME_") {
+		return name
+	}
+
+	return semconv.ErrorTypeOther.Value.AsString()
 }
