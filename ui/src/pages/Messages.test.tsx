@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { authFor } from "@/contexts/AuthContext";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
+import { authFor, type Auth } from "@/contexts/AuthContext";
 import Messages from "@/pages/Messages";
 import { RoleID } from "@/queries/users";
 import { json, renderWithClient, stubApi } from "@/test/render";
@@ -37,6 +38,28 @@ const rowCells = (to: string) =>
     .getAllByRole("gridcell")
     .map((c) => c.textContent);
 
+function Address() {
+  const { search } = useLocation();
+  const navigate = useNavigate();
+  return (
+    <>
+      <output data-testid="search">{search}</output>
+      <button onClick={() => navigate("/messages")}>Open Messages</button>
+    </>
+  );
+}
+
+const renderMessages = (path = "/messages", auth?: Auth) =>
+  renderWithClient(
+    <MemoryRouter initialEntries={[path]}>
+      <Messages />
+      <Address />
+    </MemoryRouter>,
+    auth,
+  );
+
+const search = () => screen.getByTestId("search").textContent;
+
 afterEach(() => {
   vi.unstubAllGlobals();
 });
@@ -55,7 +78,7 @@ describe("Messages", () => {
       message({ id: 8, to: "+15551230008", encoding: "binary" }),
     ]);
 
-    renderWithClient(<Messages />);
+    renderMessages();
 
     await screen.findByText("+15551230007");
     expect(rowCells("+15551230007")).toEqual([
@@ -74,10 +97,94 @@ describe("Messages", () => {
     }
   });
 
+  it("filters by the status and time range of the address", async () => {
+    const requests = serveMessages();
+    const before = Date.now();
+
+    renderMessages("/messages?status=failed&range=24h");
+
+    await listed();
+    const query = lastQuery(requests);
+    expect(query).toMatchObject({ status: "failed" });
+    expect(Date.parse(query.start)).toBeGreaterThanOrEqual(
+      before - 24 * 60 * 60_000 - 1000,
+    );
+    expect(screen.getByRole("combobox", { name: "Status" })).toHaveTextContent(
+      "Failed",
+    );
+  });
+
+  it("keeps the status and time range chosen in the address", async () => {
+    serveMessages();
+
+    renderMessages();
+    await listed();
+
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "Status" }));
+    fireEvent.click(await screen.findByRole("option", { name: "Failed" }));
+    await waitFor(() => expect(search()).toBe("?status=failed"));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Time range: Any time" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Last 24 hours" }),
+    );
+    await waitFor(() => expect(search()).toBe("?status=failed&range=24h"));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Time range: Last 24 hours" }),
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Any time" }));
+    fireEvent.mouseDown(screen.getByRole("combobox", { name: "Status" }));
+    fireEvent.click(await screen.findByRole("option", { name: "All" }));
+    await waitFor(() => expect(search()).toBe(""));
+  });
+
+  it("filters by the custom time range of the address", async () => {
+    const requests = serveMessages();
+    const start = "2026-09-30T10:00:00.000Z";
+    const end = "2026-09-30T11:30:00.000Z";
+
+    renderMessages(`/messages?range=custom&start=${start}&end=${end}`);
+
+    await listed();
+    expect(lastQuery(requests)).toMatchObject({ start, end });
+  });
+
+  it("returns to the first page when the address changes", async () => {
+    const requests = serveMessages([message()], 60);
+
+    renderMessages("/messages?status=failed");
+    await listed();
+
+    fireEvent.click(screen.getByRole("button", { name: "Go to next page" }));
+    await waitFor(() =>
+      expect(lastQuery(requests)).toMatchObject({
+        page: "2",
+        status: "failed",
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Messages" }));
+    await waitFor(() =>
+      expect(lastQuery(requests)).toEqual({ page: "1", per_page: "25" }),
+    );
+  });
+
+  it("ignores an unknown status in the address", async () => {
+    const requests = serveMessages();
+
+    renderMessages("/messages?status=lost");
+
+    await listed();
+    expect(lastQuery(requests)).toEqual({ page: "1", per_page: "25" });
+  });
+
   it("requests the first page by default", async () => {
     const requests = serveMessages();
 
-    renderWithClient(<Messages />);
+    renderMessages();
 
     await listed();
     expect(lastQuery(requests)).toEqual({ page: "1", per_page: "25" });
@@ -86,7 +193,7 @@ describe("Messages", () => {
   it("filters by all or part of the recipient's number", async () => {
     const requests = serveMessages();
 
-    renderWithClient(<Messages />);
+    renderMessages();
     await listed();
 
     const input = screen.getByRole("textbox", { name: "To" });
@@ -121,7 +228,7 @@ describe("Messages", () => {
   it("filters by sender, a number or a name", async () => {
     const requests = serveMessages();
 
-    renderWithClient(<Messages />);
+    renderMessages();
     await listed();
 
     const input = screen.getByRole("textbox", { name: "From" });
@@ -162,7 +269,7 @@ describe("Messages", () => {
   it("filters by time range", async () => {
     const requests = serveMessages();
 
-    renderWithClient(<Messages />);
+    renderMessages();
     await listed();
 
     fireEvent.click(
@@ -210,7 +317,7 @@ describe("Messages", () => {
   it("filters by status", async () => {
     const requests = serveMessages();
 
-    renderWithClient(<Messages />);
+    renderMessages();
     await listed();
 
     fireEvent.mouseDown(screen.getByRole("combobox", { name: "Status" }));
@@ -224,7 +331,7 @@ describe("Messages", () => {
   it("opens the message detail when a row is clicked", async () => {
     serveMessages();
 
-    renderWithClient(<Messages />);
+    renderMessages();
     fireEvent.click(await listed());
 
     const drawer = await screen.findByRole("complementary", {
@@ -266,7 +373,7 @@ describe("Messages", () => {
       ),
     );
 
-    renderWithClient(<Messages />);
+    renderMessages();
     await listed();
     const listedBefore = lists.length;
 
@@ -300,7 +407,7 @@ describe("Messages", () => {
   it("shows an empty list", async () => {
     serveMessages([]);
 
-    renderWithClient(<Messages />);
+    renderMessages();
 
     expect(await screen.findByText("No messages.")).toBeInTheDocument();
   });
@@ -316,7 +423,7 @@ describe("Messages", () => {
       ),
     );
 
-    renderWithClient(<Messages />);
+    renderMessages();
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("Failed to load messages");
@@ -365,7 +472,7 @@ describe("Messages delivery settings", () => {
   it("shows and updates the validity and retries", async () => {
     const bodies = serveDelivery();
 
-    renderWithClient(<Messages />);
+    renderMessages();
 
     const line = screen.getByTestId("delivery-settings");
     await waitFor(() =>
@@ -429,7 +536,7 @@ describe("Messages retention", () => {
       ),
     );
 
-    renderWithClient(<Messages />);
+    renderMessages();
 
     const line = screen.getByTestId("delivery-settings");
     await waitFor(() => expect(line).toHaveTextContent("Retention: 30 days"));
@@ -451,7 +558,7 @@ describe("Messages by role", () => {
   it("lets a Read Only user read, but not send or edit", async () => {
     serveMessages();
 
-    renderWithClient(<Messages />, authFor("ro@example.com", RoleID.ReadOnly));
+    renderMessages("/messages", authFor("ro@example.com", RoleID.ReadOnly));
 
     await listed();
     expect(
@@ -469,10 +576,7 @@ describe("Messages by role", () => {
   it("shows a Submitter its messages, without delivery settings or submitters", async () => {
     serveMessages();
 
-    renderWithClient(
-      <Messages />,
-      authFor("ota@example.com", RoleID.Submitter),
-    );
+    renderMessages("/messages", authFor("ota@example.com", RoleID.Submitter));
 
     await listed();
     expect(screen.getByRole("button", { name: "Send" })).toBeInTheDocument();

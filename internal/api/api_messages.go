@@ -557,16 +557,7 @@ func ListMessages(cfg Config) http.Handler {
 			}
 		}
 
-		if filter.Start, ok = timeParam(w, r, q.Get("start"), "start", cfg); !ok {
-			return
-		}
-
-		if filter.End, ok = timeParam(w, r, q.Get("end"), "end", cfg); !ok {
-			return
-		}
-
-		if !filter.Start.IsZero() && !filter.End.IsZero() && filter.End.Before(filter.Start) {
-			writeError(w, r, http.StatusBadRequest, "end must not be before start", nil, cfg.Logger)
+		if filter.Start, filter.End, ok = timeRange(w, r, cfg); !ok {
 			return
 		}
 
@@ -584,6 +575,39 @@ func ListMessages(cfg Config) http.Handler {
 
 		writeResponse(w, r, ListMessagesResponse{Items: items, Page: page, PerPage: perPage, TotalCount: total}, http.StatusOK,
 			cfg.Logger)
+	})
+}
+
+type MessageCounts struct {
+	Pending   int `json:"pending"`
+	Delivered int `json:"delivered"`
+	Failed    int `json:"failed"`
+	Expired   int `json:"expired"`
+	Replaced  int `json:"replaced"`
+}
+
+func CountMessages(cfg Config) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		filter := db.MessageFilter{SubmittedBy: ownSubmissions(r.Context())}
+
+		var ok bool
+		if filter.Start, filter.End, ok = timeRange(w, r, cfg); !ok {
+			return
+		}
+
+		counts, err := cfg.Store.CountMessages(r.Context(), filter)
+		if err != nil {
+			writeError(w, r, http.StatusInternalServerError, "Failed to count messages", err, cfg.Logger)
+			return
+		}
+
+		writeResponse(w, r, MessageCounts{
+			Pending:   counts[db.StatusPending],
+			Delivered: counts[db.StatusDelivered],
+			Failed:    counts[db.StatusFailed],
+			Expired:   counts[db.StatusExpired],
+			Replaced:  counts[db.StatusReplaced],
+		}, http.StatusOK, cfg.Logger)
 	})
 }
 
@@ -702,6 +726,27 @@ func formatAddress(a db.Address) string {
 }
 
 // RFC 3339
+func timeRange(w http.ResponseWriter, r *http.Request, cfg Config) (time.Time, time.Time, bool) {
+	q := r.URL.Query()
+
+	start, ok := timeParam(w, r, q.Get("start"), "start", cfg)
+	if !ok {
+		return time.Time{}, time.Time{}, false
+	}
+
+	end, ok := timeParam(w, r, q.Get("end"), "end", cfg)
+	if !ok {
+		return time.Time{}, time.Time{}, false
+	}
+
+	if !start.IsZero() && !end.IsZero() && end.Before(start) {
+		writeError(w, r, http.StatusBadRequest, "end must not be before start", nil, cfg.Logger)
+		return time.Time{}, time.Time{}, false
+	}
+
+	return start, end, true
+}
+
 func timeParam(w http.ResponseWriter, r *http.Request, value, name string, cfg Config) (time.Time, bool) {
 	if value == "" {
 		return time.Time{}, true
