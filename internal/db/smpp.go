@@ -109,16 +109,6 @@ func queueNotifications(ctx context.Context, tx *sql.Tx, messageID int64, status
 	return queued, nil
 }
 
-func (d *DB) OnNotificationsQueued(f func()) {
-	d.queued = f
-}
-
-func (d *DB) notificationsQueued(queued bool) {
-	if queued && d.queued != nil {
-		d.queued()
-	}
-}
-
 type Notification struct {
 	ID                   int64
 	ESMEID               int64
@@ -137,33 +127,18 @@ type Notification struct {
 const notificationColumns = `n.id, s.esme_id, n.type, n.attempts, n.tp_status, s.source_npi,
 	s.data_coding, s.user_message_reference, a.deliver_report, a.outcome`
 
-func (d *DB) DueNotifications(ctx context.Context, esmeID int64, now time.Time, exclude []int64, limit int,
-) (_ []Notification, err error) {
-	defer d.observe(&err)()
-
+func dueNotifications(ctx context.Context, q querier, esmeID int64, now time.Time, limit int) ([]Notification, error) {
 	at := now.UTC().UnixNano()
-	args := []any{esmeID, at, at}
 
-	notIn := ""
-	if len(exclude) > 0 {
-		notIn = ` AND n.id NOT IN (?` + strings.Repeat(`, ?`, len(exclude)-1) + `)`
-
-		for _, id := range exclude {
-			args = append(args, id)
-		}
-	}
-
-	args = append(args, limit)
-
-	rows, err := d.conn.QueryContext(ctx, `SELECT `+notificationColumns+`, `+prefixed("m.", messageColumns)+`
+	rows, err := q.QueryContext(ctx, `SELECT `+notificationColumns+`, `+prefixed("m.", messageColumns)+`
 		FROM smpp_notifications n
 		CROSS JOIN smpp_messages s ON s.message_id = n.message_id
 		JOIN messages m ON m.id = n.message_id
 		LEFT JOIN delivery_attempts a ON a.id = n.attempt_id
 		WHERE s.esme_id = ? AND n.result IS NULL AND n.next_attempt_at <= ? AND n.expires_at > ?
 		AND NOT EXISTS (SELECT 1 FROM smpp_notifications o WHERE o.message_id = n.message_id AND o.id < n.id
-			AND o.result IS NULL)`+notIn+`
-		ORDER BY n.id LIMIT ?`, args...)
+			AND o.result IS NULL)
+		ORDER BY n.id LIMIT ?`, esmeID, at, at, limit)
 	if err != nil {
 		return nil, fmt.Errorf("due notifications: %w", err)
 	}
@@ -243,29 +218,48 @@ func scanNotification(rows *sql.Rows) (Notification, error) {
 	return n, nil
 }
 
+type closeNotification struct {
+	ID     int64
+	Result NotificationResult
+}
+
 func (d *DB) CloseNotification(ctx context.Context, id int64, result NotificationResult) (err error) {
 	defer d.observe(&err)()
 
-	res, err := d.conn.ExecContext(ctx, `UPDATE smpp_notifications SET result = ? WHERE id = ? AND result IS NULL`,
-		result, id)
+	_, err = submit[struct{}](ctx, d, cmdCloseNotification, closeNotification{ID: id, Result: result})
 	if err != nil {
 		return fmt.Errorf("close notification: %w", err)
-	}
-
-	if n, err := res.RowsAffected(); err != nil {
-		return fmt.Errorf("close notification: %w", err)
-	} else if n == 0 {
-		return fmt.Errorf("close notification: %w", ErrNotFound)
 	}
 
 	return nil
 }
 
-func (d *DB) RetryNotification(ctx context.Context, id int64, next time.Time) (err error) {
+func applyCloseNotification(a *applyCtx, p closeNotification) (struct{}, error) {
+	res, err := a.tx.ExecContext(a.ctx, `UPDATE smpp_notifications SET result = ?, claimed_by = NULL
+		WHERE id = ? AND result IS NULL`, p.Result, p.ID)
+	if err != nil {
+		return struct{}{}, err
+	}
+
+	if n, err := res.RowsAffected(); err != nil {
+		return struct{}{}, err
+	} else if n == 0 {
+		return struct{}{}, ErrNotFound
+	}
+
+	return struct{}{}, nil
+}
+
+type retryNotification struct {
+	ID     int64
+	Next   time.Time
+	NodeID string
+}
+
+func (d *DB) RetryNotification(ctx context.Context, id int64, next time.Time, nodeID string) (err error) {
 	defer d.observe(&err)()
 
-	_, err = d.conn.ExecContext(ctx, `UPDATE smpp_notifications SET attempts = attempts + 1, next_attempt_at = ?
-		WHERE id = ? AND result IS NULL`, next.UTC().UnixNano(), id)
+	_, err = submit[struct{}](ctx, d, cmdRetryNotification, retryNotification{ID: id, Next: next, NodeID: nodeID})
 	if err != nil {
 		return fmt.Errorf("retry notification: %w", err)
 	}
@@ -273,15 +267,38 @@ func (d *DB) RetryNotification(ctx context.Context, id int64, next time.Time) (e
 	return nil
 }
 
+func applyRetryNotification(a *applyCtx, p retryNotification) (struct{}, error) {
+	_, err := a.tx.ExecContext(a.ctx, `UPDATE smpp_notifications SET attempts = attempts + 1, next_attempt_at = ?,
+		claimed_by = NULL WHERE id = ? AND result IS NULL AND (claimed_by IS NULL OR claimed_by = ?)`,
+		p.Next.UTC().UnixNano(), p.ID, p.NodeID)
+
+	return struct{}{}, err
+}
+
+type expireNotifications struct {
+	Now time.Time
+}
+
 func (d *DB) ExpireNotifications(ctx context.Context, now time.Time) (_ map[NotificationType]int, err error) {
 	defer d.observe(&err)()
 
-	at := now.UTC().UnixNano()
-
-	rows, err := d.conn.QueryContext(ctx, `UPDATE smpp_notifications SET result = ?
-		WHERE result IS NULL AND expires_at <= ? RETURNING type`, NotificationExpired, at)
+	out, err := submit[map[NotificationType]int](ctx, d, cmdExpireNotifications, expireNotifications{Now: now})
 	if err != nil {
 		return nil, fmt.Errorf("expire notifications: %w", err)
+	}
+
+	if out == nil {
+		out = map[NotificationType]int{}
+	}
+
+	return out, nil
+}
+
+func applyExpireNotifications(a *applyCtx, p expireNotifications) (map[NotificationType]int, error) {
+	rows, err := a.tx.QueryContext(a.ctx, `UPDATE smpp_notifications SET result = ?
+		WHERE result IS NULL AND expires_at <= ? RETURNING type`, NotificationExpired, p.Now.UTC().UnixNano())
+	if err != nil {
+		return nil, err
 	}
 
 	defer func() { _ = rows.Close() }()
@@ -291,23 +308,19 @@ func (d *DB) ExpireNotifications(ctx context.Context, now time.Time) (_ map[Noti
 	for rows.Next() {
 		var t NotificationType
 		if err := rows.Scan(&t); err != nil {
-			return nil, fmt.Errorf("expire notifications: %w", err)
+			return nil, err
 		}
 
 		out[t]++
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("expire notifications: %w", err)
-	}
-
-	return out, nil
+	return out, rows.Err()
 }
 
 func (d *DB) CountPendingNotifications(ctx context.Context, now time.Time) (_ map[NotificationType]int, err error) {
 	defer d.observe(&err)()
 
-	rows, err := d.conn.QueryContext(ctx, `SELECT type, COUNT(*) FROM smpp_notifications
+	rows, err := d.reader().QueryContext(ctx, `SELECT type, COUNT(*) FROM smpp_notifications
 		WHERE result IS NULL AND expires_at > ? GROUP BY type`, now.UTC().UnixNano())
 	if err != nil {
 		return nil, fmt.Errorf("count pending notifications: %w", err)
@@ -342,7 +355,7 @@ func (d *DB) NextNotificationAt(ctx context.Context, esmeID int64, now time.Time
 
 	var at sql.Null[int64]
 
-	if err := d.conn.QueryRowContext(ctx, `SELECT MIN(CASE WHEN n.next_attempt_at > ? THEN MIN(n.next_attempt_at,
+	if err := d.reader().QueryRowContext(ctx, `SELECT MIN(CASE WHEN n.next_attempt_at > ? THEN MIN(n.next_attempt_at,
 		n.expires_at) ELSE n.expires_at END) FROM smpp_notifications n CROSS JOIN smpp_messages s ON s.message_id = n.message_id
 		WHERE s.esme_id = ? AND n.result IS NULL`,
 		now.UTC().UnixNano(), esmeID).Scan(&at); err != nil {
@@ -369,7 +382,7 @@ func (d *DB) SystemIDsFor(ctx context.Context, messageIDs []int64) (_ map[int64]
 		args[i] = id
 	}
 
-	rows, err := d.conn.QueryContext(ctx, `SELECT s.message_id, e.system_id FROM smpp_messages s
+	rows, err := d.reader().QueryContext(ctx, `SELECT s.message_id, e.system_id FROM smpp_messages s
 		JOIN esmes e ON e.id = s.esme_id WHERE s.message_id IN (?`+strings.Repeat(`, ?`, len(messageIDs)-1)+`)`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get system IDs: %w", err)

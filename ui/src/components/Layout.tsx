@@ -23,6 +23,7 @@ import {
   Brightness6 as ThemeIcon,
   BugReport as BugReportIcon,
   Dashboard as DashboardIcon,
+  Cable as CableIcon,
   Check as CheckIcon,
   DarkMode as DarkModeIcon,
   Feed as FeedIcon,
@@ -102,7 +103,7 @@ const navItems: NavItem[] = [
   {
     to: "/diameter",
     label: "Diameter",
-    icon: <HubIcon color="primary" />,
+    icon: <CableIcon color="primary" />,
     permission: "diameter:read",
   },
   {
@@ -131,6 +132,12 @@ const systemItems: NavItem[] = [
     label: "Single Sign-On",
     icon: <KeyIcon color="primary" />,
     permission: "oidc:read",
+  },
+  {
+    to: "/cluster",
+    label: "Cluster",
+    icon: <HubIcon color="primary" />,
+    permission: "cluster:read",
   },
 ];
 

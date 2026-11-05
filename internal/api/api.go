@@ -40,12 +40,9 @@ type ESMEStore interface {
 	DeleteESME(ctx context.Context, id int64) error
 	GetESMEBySystemID(ctx context.Context, systemID string) (db.ESME, error)
 	ListESMEs(ctx context.Context) ([]db.ESME, error)
-	ListESMEsOfUser(ctx context.Context, userID int64) ([]db.ESME, error)
 }
 
 type SMPP interface {
-	CloseESME(esmeID int64)
-	CloseUser(ctx context.Context, userID int64) error
 	Sessions(esmeID int64) []SMPPSession
 }
 
@@ -57,9 +54,7 @@ type SMPPSession struct {
 
 type noSMPP struct{}
 
-func (noSMPP) CloseESME(int64)                        {}
-func (noSMPP) CloseUser(context.Context, int64) error { return nil }
-func (noSMPP) Sessions(int64) []SMPPSession           { return nil }
+func (noSMPP) Sessions(int64) []SMPPSession { return nil }
 
 type Diameter interface {
 	Identity() diameter.Identity
@@ -101,8 +96,10 @@ type Config struct {
 	ESMEs          ESMEStore
 	OIDC           OIDC
 	SMPP           SMPP
-	JWTSecret      []byte
-	OIDCCookieKey  []byte
+	Backups        Backups
+	Cluster        Cluster
+	JWTSecret      func() []byte
+	OIDCCookieKey  func() []byte
 	SecureCookie   bool
 	BcryptCost     int
 	TracerProvider trace.TracerProvider
@@ -157,6 +154,17 @@ func routes(cfg Config, a *auth) []route {
 		{"GET /api/v1/oidc", PermReadOIDC, a.needsLogin(GetOIDC(cfg))},
 		{"PUT /api/v1/oidc", PermUpdateOIDC, a.needsLogin(UpdateOIDC(a))},
 		{"POST /api/v1/oidc/discovery", PermUpdateOIDC, a.needsLogin(DiscoverOIDC(cfg))},
+
+		{"GET /api/v1/cluster", PermReadCluster, GetCluster(cfg)},
+		{"POST /api/v1/cluster/tokens", PermManageCluster, a.needsLogin(CreateJoinToken(a))},
+		{"POST /api/v1/cluster/join", public, JoinCluster(a)},
+		{"PUT /api/v1/cluster/members/{node_id}", PermManageCluster, a.needsLogin(UpdateMember(a))},
+		{"DELETE /api/v1/cluster/members/{node_id}", PermManageCluster, a.needsLogin(RemoveMember(a))},
+		{"POST /api/v1/cluster/members/{node_id}/drain", PermManageCluster, a.needsLogin(DrainMember(a, db.DrainDraining))},
+		{"POST /api/v1/cluster/members/{node_id}/resume", PermManageCluster, a.needsLogin(DrainMember(a, db.DrainActive))},
+
+		{"GET /api/v1/backup", PermBackup, Backup(a)},
+		{"POST /api/v1/restore", PermBackup, a.needsLogin(Restore(a))},
 
 		{"GET /api/v1/users/me", PermSelf, GetMyUser(a)},
 		{"PUT /api/v1/users/me/password", PermSelf, a.needsLogin(UpdateMyPassword(a))},

@@ -3,12 +3,16 @@ package db
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/ellanetworks/smsc/internal/tpdu"
 )
 
 var (
@@ -118,7 +122,7 @@ func TestMessageLifecycle(t *testing.T) {
 	}
 
 	delivered := submitted.Add(time.Second)
-	if err := d.CompleteMessage(ctx, id, StatusDelivered, delivered, nil, 0); err != nil {
+	if err := d.CompleteMessage(ctx, id, StatusDelivered, delivered, nil, 0, Fence{}); err != nil {
 		t.Fatalf("CompleteMessage: %v", err)
 	}
 
@@ -139,7 +143,7 @@ func TestGetMessageNotFound(t *testing.T) {
 }
 
 func TestCompleteMessageNotFound(t *testing.T) {
-	err := openTestDB(t).CompleteMessage(context.Background(), 42, StatusFailed, time.Now(), nil, 0)
+	err := openTestDB(t).CompleteMessage(context.Background(), 42, StatusFailed, time.Now(), nil, 0, Fence{})
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
@@ -155,7 +159,7 @@ func TestCompleteMessageRejectsOtherStatuses(t *testing.T) {
 	}
 
 	for _, status := range []MessageStatus{StatusPending, StatusReplaced, "lost"} {
-		if err := d.CompleteMessage(ctx, id, status, time.Now(), nil, 0); err == nil {
+		if err := d.CompleteMessage(ctx, id, status, time.Now(), nil, 0, Fence{}); err == nil {
 			t.Fatalf("expected an error for status %q", status)
 		}
 	}
@@ -171,11 +175,11 @@ func TestCompleteMessageOnlyCompletesPendingMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := d.CompleteMessage(ctx, id, StatusFailed, now, nil, 0); err != nil {
+	if err := d.CompleteMessage(ctx, id, StatusFailed, now, nil, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
-	err = d.CompleteMessage(ctx, id, StatusDelivered, now.Add(time.Second), testReport(now), 0)
+	err = d.CompleteMessage(ctx, id, StatusDelivered, now.Add(time.Second), testReport(now), 0, Fence{})
 	if !errors.Is(err, ErrNotPending) {
 		t.Fatalf("err = %v, want ErrNotPending", err)
 	}
@@ -377,7 +381,7 @@ func TestListMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := d.CompleteMessage(ctx, ids[3], StatusDelivered, now, nil, 0); err != nil {
+	if err := d.CompleteMessage(ctx, ids[3], StatusDelivered, now, nil, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -434,7 +438,7 @@ func TestCountMessages(t *testing.T) {
 	}
 
 	for _, id := range []int64{ids[0], ids[1], ids[3]} {
-		if err := d.CompleteMessage(ctx, id, StatusDelivered, now, nil, 0); err != nil {
+		if err := d.CompleteMessage(ctx, id, StatusDelivered, now, nil, 0, Fence{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -510,7 +514,7 @@ func TestRejectDuplicates(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if err := d.CompleteMessage(ctx, id, StatusDelivered, now, nil, 0); err != nil {
+		if err := d.CompleteMessage(ctx, id, StatusDelivered, now, nil, 0, Fence{}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -629,7 +633,7 @@ func TestReplaceShortMessage(t *testing.T) {
 		})
 	}
 
-	if err := d.CompleteMessage(ctx, replacementID, StatusDelivered, now, nil, 0); err != nil {
+	if err := d.CompleteMessage(ctx, replacementID, StatusDelivered, now, nil, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -643,6 +647,26 @@ func TestReplaceShortMessage(t *testing.T) {
 	}
 }
 
+func reportedSubmit(t *testing.T, reference uint8) []byte {
+	t.Helper()
+
+	b, err := tpdu.Submit{
+		StatusReportRequest: true,
+		MessageReference:    reference,
+		ProtocolIdentifier:  0x41,
+		Destination: tpdu.Address{
+			TypeOfNumber:  tpdu.TypeOfNumberInternational,
+			NumberingPlan: tpdu.NumberingPlanISDN,
+			Digits:        testMSISDN,
+		},
+	}.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return b
+}
+
 func TestReplacedMessageStatusReport(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
@@ -650,44 +674,44 @@ func TestReplacedMessageStatusReport(t *testing.T) {
 	t.Run("stored with the replacement", func(t *testing.T) {
 		d := openTestDB(t)
 
-		id, err := d.CreateMessage(ctx, replaceType(testMessage(1, false, []byte{0x01}, now)))
+		id, err := d.CreateMessage(ctx, replaceType(testMessage(1, false, reportedSubmit(t, 1), now)))
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		var seen Message
-
-		replacement := replaceType(testMessage(2, false, []byte{0x02}, now.Add(time.Minute)))
-		replacement.ReportReplaced = func(replaced Message) (*NewStatusReport, error) {
-			seen = replaced
-			return testReport(now.Add(time.Minute)), nil
-		}
+		replacement := replaceType(testMessage(2, false, reportedSubmit(t, 2), now.Add(time.Minute)))
+		replacement.ReportReplaced = true
 
 		if _, err := d.CreateMessage(ctx, replacement); err != nil {
 			t.Fatal(err)
 		}
 
-		if seen.ID != id || seen.Status != StatusReplaced || !bytes.Equal(seen.TPDU, []byte{0x01}) {
-			t.Fatalf("ReportReplaced got %+v", seen)
+		reports, err := listStatusReports(ctx, d, id)
+		if err != nil || len(reports) != 1 {
+			t.Fatalf("reports = %+v, %v; want one", reports, err)
 		}
 
-		if reports, err := listStatusReports(ctx, d, id); err != nil || len(reports) != 1 {
-			t.Fatalf("reports = %+v, %v; want one", reports, err)
+		s, err := d.GetSettings(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		r := reports[0]
+		if r.ReportStatus != uint8(tpdu.StatusReplaced) || r.Originator.Digits != s.Operator.ServiceCentreAddress ||
+			!r.ExpiresAt.Equal(now.Add(time.Minute).Add(s.Delivery.DefaultValidity)) {
+			t.Fatalf("report = %+v", r)
 		}
 	})
 
 	t.Run("none when not wanted", func(t *testing.T) {
 		d := openTestDB(t)
 
-		id, err := d.CreateMessage(ctx, replaceType(testMessage(1, false, []byte{0x01}, now)))
+		id, err := d.CreateMessage(ctx, replaceType(testMessage(1, false, reportedSubmit(t, 1), now)))
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		replacement := replaceType(testMessage(2, false, []byte{0x02}, now))
-		replacement.ReportReplaced = func(Message) (*NewStatusReport, error) { return nil, nil }
-
-		if _, err := d.CreateMessage(ctx, replacement); err != nil {
+		if _, err := d.CreateMessage(ctx, replaceType(testMessage(2, false, reportedSubmit(t, 2), now))); err != nil {
 			t.Fatal(err)
 		}
 
@@ -696,7 +720,7 @@ func TestReplacedMessageStatusReport(t *testing.T) {
 		}
 	})
 
-	t.Run("a failure stores nothing", func(t *testing.T) {
+	t.Run("none for an undecodable original", func(t *testing.T) {
 		d := openTestDB(t)
 
 		id, err := d.CreateMessage(ctx, replaceType(testMessage(1, false, []byte{0x01}, now)))
@@ -704,21 +728,39 @@ func TestReplacedMessageStatusReport(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		replacement := replaceType(testMessage(2, false, []byte{0x02}, now))
-		replacement.ReportReplaced = func(Message) (*NewStatusReport, error) { return nil, errors.New("no report") }
+		replacement := replaceType(testMessage(2, false, reportedSubmit(t, 2), now))
+		replacement.ReportReplaced = true
 
-		if _, err := d.CreateMessage(ctx, replacement); err == nil {
-			t.Fatal("expected an error")
+		if _, err := d.CreateMessage(ctx, replacement); err != nil {
+			t.Fatal(err)
 		}
 
-		if m, err := d.GetMessage(ctx, id); err != nil || m.Status != StatusPending {
-			t.Fatalf("message = %+v, %v; want it still pending", m, err)
+		if m, err := d.GetMessage(ctx, id); err != nil || m.Status != StatusReplaced {
+			t.Fatalf("message = %+v, %v; want it replaced", m, err)
 		}
 
-		if messages, total, err := d.ListMessages(ctx, MessageFilter{}, 1, 10); err != nil || total != 1 {
-			t.Fatalf("messages = %+v, %d, %v; want only the original", messages, total, err)
+		if reports, err := listStatusReports(ctx, d, id); err != nil || len(reports) != 0 {
+			t.Fatalf("reports = %+v, %v; want none", reports, err)
 		}
 	})
+}
+
+func nextDue(ctx context.Context, d *DB, now time.Time, busy ...string) (Message, bool, error) {
+	due, _, err := d.DueRecipients(ctx, now, 1, func(msisdn string) bool { return slices.Contains(busy, msisdn) })
+	if err != nil || len(due) == 0 {
+		return Message{}, false, err
+	}
+
+	return d.NextDue(ctx, due[0], now)
+}
+
+func nextWakeup(ctx context.Context, d *DB, busy ...string) (time.Time, bool, error) {
+	due, at, err := d.DueRecipients(ctx, time.Unix(0, 0), 1, func(msisdn string) bool { return slices.Contains(busy, msisdn) })
+	if err != nil || len(due) > 0 {
+		return time.Time{}, false, err
+	}
+
+	return at, !at.IsZero(), nil
 }
 
 func TestDeliveryScheduling(t *testing.T) {
@@ -736,20 +778,20 @@ func TestDeliveryScheduling(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, ok, err := d.NextDue(ctx, base.Add(-time.Second), nil); err != nil || ok {
+	if _, ok, err := nextDue(ctx, d, base.Add(-time.Second)); err != nil || ok {
 		t.Fatalf("NextDue before anything is due = %v, %v", ok, err)
 	}
 
-	m, ok, err := d.NextDue(ctx, base.Add(time.Minute), nil)
+	m, ok, err := nextDue(ctx, d, base.Add(time.Minute))
 	if err != nil || !ok || m.ID != first {
 		t.Fatalf("NextDue = %+v, %v, %v; want message %d", m, ok, err, first)
 	}
 
-	if err := d.ScheduleRetry(ctx, first, base.Add(time.Hour), base.Add(time.Minute), false); err != nil {
+	if err := d.ScheduleRetry(ctx, first, base.Add(time.Hour), base.Add(time.Minute), false, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
-	m, ok, err = d.NextDue(ctx, base.Add(time.Minute), nil)
+	m, ok, err = nextDue(ctx, d, base.Add(time.Minute))
 	if err != nil || !ok || m.ID != second {
 		t.Fatalf("NextDue after retry = %+v, %v, %v; want message %d", m, ok, err, second)
 	}
@@ -759,7 +801,7 @@ func TestDeliveryScheduling(t *testing.T) {
 		t.Fatalf("retried message = %+v, %v", retried, err)
 	}
 
-	wakeup, ok, err := d.NextWakeup(ctx, nil)
+	wakeup, ok, err := nextWakeup(ctx, d)
 	if err != nil || !ok || !wakeup.Equal(base.Add(time.Second)) {
 		t.Fatalf("NextWakeup = %v, %v, %v", wakeup, ok, err)
 	}
@@ -772,19 +814,19 @@ func TestDeliveryScheduling(t *testing.T) {
 		t.Fatalf("NextDueFor = %+v, %v, %v; want message %d", next, ok, err, second)
 	}
 
-	if err := d.CompleteMessage(ctx, second, StatusExpired, base, nil, 0); err != nil {
+	if err := d.CompleteMessage(ctx, second, StatusExpired, base, nil, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := d.CompleteMessage(ctx, first, StatusDelivered, base, nil, 0); err != nil {
+	if err := d.CompleteMessage(ctx, first, StatusDelivered, base, nil, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := d.ScheduleRetry(ctx, first, base, base, false); !errors.Is(err, ErrNotFound) {
+	if err := d.ScheduleRetry(ctx, first, base, base, false, time.Time{}, Fence{}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ScheduleRetry on a delivered message = %v, want ErrNotFound", err)
 	}
 
-	if _, ok, err := d.NextWakeup(ctx, nil); err != nil || ok {
+	if _, ok, err := nextWakeup(ctx, d); err != nil || ok {
 		t.Fatalf("NextWakeup with nothing pending = %v, %v", ok, err)
 	}
 }
@@ -806,16 +848,16 @@ func TestNextDueSkipsBusyRecipients(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m, ok, err := d.NextDue(ctx, base.Add(time.Minute), []string{testMSISDN})
+	m, ok, err := nextDue(ctx, d, base.Add(time.Minute), testMSISDN)
 	if err != nil || !ok || m.ID != otherID || m.MSISDN != "15551230003" {
 		t.Fatalf("NextDue = %+v, %v, %v; want message %d", m, ok, err, otherID)
 	}
 
-	if _, ok, err := d.NextDue(ctx, base.Add(time.Minute), []string{testMSISDN, "15551230003"}); err != nil || ok {
+	if _, ok, err := nextDue(ctx, d, base.Add(time.Minute), testMSISDN, "15551230003"); err != nil || ok {
 		t.Fatalf("NextDue with every recipient busy = %v, %v", ok, err)
 	}
 
-	wakeup, ok, err := d.NextWakeup(ctx, []string{testMSISDN})
+	wakeup, ok, err := nextWakeup(ctx, d, testMSISDN)
 	if err != nil || !ok || !wakeup.Equal(base.Add(time.Second)) {
 		t.Fatalf("NextWakeup = %v, %v, %v", wakeup, ok, err)
 	}
@@ -841,12 +883,12 @@ func TestHoldAndAlertRecipient(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := d.ScheduleRetry(ctx, later, base.Add(2*time.Hour), base, false); err != nil {
+	if err := d.ScheduleRetry(ctx, later, base.Add(2*time.Hour), base, false, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
 	until := base.Add(time.Hour)
-	if err := d.ScheduleRetry(ctx, first, until, base, true); err != nil {
+	if err := d.ScheduleRetry(ctx, first, until, base, true, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -857,7 +899,7 @@ func TestHoldAndAlertRecipient(t *testing.T) {
 		}
 	}
 
-	if _, ok, err := d.NextDue(ctx, base.Add(time.Minute), nil); err != nil || ok {
+	if _, ok, err := nextDue(ctx, d, base.Add(time.Minute)); err != nil || ok {
 		t.Fatalf("NextDue while held = %v, %v", ok, err)
 	}
 
@@ -886,7 +928,7 @@ func TestAlertMSISDN(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := d.ScheduleRetry(ctx, id, base.Add(time.Hour), base, true); err != nil {
+	if err := d.ScheduleRetry(ctx, id, base.Add(time.Hour), base, true, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -934,7 +976,7 @@ func TestNewMessageJoinsRecipientHold(t *testing.T) {
 	}
 
 	until := base.Add(time.Hour)
-	if err := d.ScheduleRetry(ctx, first, until, base, true); err != nil {
+	if err := d.ScheduleRetry(ctx, first, until, base, true, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -977,7 +1019,7 @@ func TestOnlyHoldsDelayNewMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := d.ScheduleRetry(ctx, first, base.Add(time.Hour), base, false); err != nil {
+	if err := d.ScheduleRetry(ctx, first, base.Add(time.Hour), base, false, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -990,11 +1032,11 @@ func TestOnlyHoldsDelayNewMessages(t *testing.T) {
 		t.Fatalf("message after a plain retry next attempt = %v, %v; a retry is not a hold", m.NextAttemptAt, err)
 	}
 
-	if err := d.ScheduleRetry(ctx, first, base.Add(2*time.Hour), base.Add(time.Minute), true); err != nil {
+	if err := d.ScheduleRetry(ctx, first, base.Add(2*time.Hour), base.Add(time.Minute), true, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := d.ScheduleRetry(ctx, first, base.Add(90*time.Minute), base.Add(time.Minute), true); err != nil {
+	if err := d.ScheduleRetry(ctx, first, base.Add(90*time.Minute), base.Add(time.Minute), true, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1033,11 +1075,11 @@ func TestCountPending(t *testing.T) {
 		}
 	}
 
-	if err := d.CompleteMessage(ctx, 1, StatusDelivered, now, testReport(now), 0); err != nil {
+	if err := d.CompleteMessage(ctx, 1, StatusDelivered, now, testReport(now), 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := d.ScheduleRetry(ctx, 2, now.Add(time.Minute), now, false); err != nil {
+	if err := d.ScheduleRetry(ctx, 2, now.Add(time.Minute), now, false, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1051,7 +1093,7 @@ func TestCountPending(t *testing.T) {
 		t.Fatalf("CountPending a minute later = %+v, %v, want %+v", got, err, want)
 	}
 
-	if err := d.CompleteMessage(ctx, 4, StatusDelivered, now, nil, 0); err != nil {
+	if err := d.CompleteMessage(ctx, 4, StatusDelivered, now, nil, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1076,7 +1118,7 @@ func TestScheduleRetryHoldsOnlyWhenAsked(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := d.ScheduleRetry(ctx, first, base.Add(time.Hour), base, false); err != nil {
+	if err := d.ScheduleRetry(ctx, first, base.Add(time.Hour), base, false, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1084,7 +1126,7 @@ func TestScheduleRetryHoldsOnlyWhenAsked(t *testing.T) {
 		t.Fatalf("other message after a retry without hold = %v, %v; want it still due", m.NextAttemptAt, err)
 	}
 
-	if err := d.ScheduleRetry(ctx, second, base.Add(time.Minute), base, true); err != nil {
+	if err := d.ScheduleRetry(ctx, second, base.Add(time.Minute), base, true, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1122,7 +1164,7 @@ func TestMessagesAreDueNoLaterThanTheyExpire(t *testing.T) {
 	}
 
 	until := base.Add(time.Hour)
-	if err := d.ScheduleRetry(ctx, first, until, base, true); err != nil {
+	if err := d.ScheduleRetry(ctx, first, until, base, true, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1284,8 +1326,79 @@ func TestMessagesSubmittedBy(t *testing.T) {
 		"message from an MS with a submitter": `UPDATE messages SET submitted_by = 1 WHERE origin = 'mobile'`,
 		"unknown submitter":                   `UPDATE messages SET submitted_by = 42 WHERE origin = 'api'`,
 	} {
-		if _, err := d.conn.ExecContext(ctx, statement); err == nil {
+		if _, err := d.writer.ExecContext(ctx, statement); err == nil {
 			t.Errorf("%s: no constraint failed", name)
 		}
+	}
+}
+
+func TestCompleteMessageRecordsAttempts(t *testing.T) {
+	ctx := context.Background()
+	d := openTestDB(t)
+	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+
+	id, err := d.CreateMessage(ctx, testMessage(1, false, []byte{0x01}, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := DeliveryAttempt{MessageID: id, StartedAt: now, CompletedAt: now, Step: StepDelivery, Node: "mme", Outcome: "success"}
+
+	if err := d.CompleteMessage(ctx, id, StatusDelivered, now, nil, 0, Fence{}, a); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := d.CompleteMessage(ctx, id, StatusDelivered, now, nil, 0, Fence{}, a); !errors.Is(err, ErrNotPending) {
+		t.Fatalf("err = %v, want ErrNotPending", err)
+	}
+
+	attempts, total, err := d.ListDeliveryAttempts(ctx, id, 1, 10)
+	if err != nil || total != 1 || attempts[0].Node != "mme" {
+		t.Fatalf("attempts = %+v, %d, %v; want the one recorded with the completion", attempts, total, err)
+	}
+}
+
+func TestScheduleRetryRecordsAttempts(t *testing.T) {
+	ctx := context.Background()
+	d := openTestDB(t)
+	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+
+	id, err := d.CreateMessage(ctx, testMessage(1, false, []byte{0x01}, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a := DeliveryAttempt{MessageID: id, StartedAt: now, CompletedAt: now, Step: StepDelivery, Node: "mme", Outcome: "absent"}
+
+	if err := d.ScheduleRetry(ctx, id, now.Add(time.Minute), now, false, now, Fence{}, a); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, total, err := d.ListDeliveryAttempts(ctx, id, 1, 10); err != nil || total != 1 {
+		t.Fatalf("total = %d, %v; want 1", total, err)
+	}
+}
+
+func TestRecordAttemptAndClaimSetsAlertMSISDN(t *testing.T) {
+	ctx := context.Background()
+	d := openTestDB(t)
+	now := time.Date(2026, 9, 27, 12, 0, 0, 0, time.UTC)
+
+	id, err := d.CreateMessage(ctx, testMessage(1, false, []byte{0x01}, now))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alert := "15559990000"
+	a := DeliveryAttempt{MessageID: id, StartedAt: now, CompletedAt: now, Step: StepRouting, Node: "hss", Outcome: "success"}
+
+	if _, err := d.RecordAttemptAndClaim(ctx, a, testMSISDN, 1, &alert); err != nil {
+		t.Fatal(err)
+	}
+
+	var got sql.NullString
+	if err := d.reader().QueryRowContext(ctx, `SELECT alert_msisdn FROM recipients WHERE msisdn = ?`, testMSISDN).Scan(&got); err != nil ||
+		got.String != alert {
+		t.Fatalf("alert_msisdn = %v, %v; want %s", got, err, alert)
 	}
 }

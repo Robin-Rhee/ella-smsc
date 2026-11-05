@@ -40,10 +40,7 @@ func createMobileMessage(t *testing.T, a *testAPI, srr bool, protocolIdentifier 
 	id, err := a.store.CreateMessage(context.Background(), db.NewMessage{
 		Originator: from, Recipient: to, MSISDN: to.Digits, Origin: db.OriginMobile, MessageReference: 7,
 		ProtocolIdentifier: protocolIdentifier, Replace: replace, TPDU: b, SubmittedAt: testNow,
-		ExpiresAt: testNow.Add(time.Hour),
-		ReportReplaced: func(replaced db.Message) (*db.NewStatusReport, error) {
-			return statusreport.For(replaced, tpdu.StatusReplaced, testNow, reportSettings)
-		},
+		ExpiresAt: testNow.Add(time.Hour), ReportReplaced: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +66,7 @@ func TestMessageStatusReports(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := a.store.CompleteMessage(ctx, m.ID, db.StatusDelivered, delivered, report, 0); err != nil {
+	if err := a.store.CompleteMessage(ctx, m.ID, db.StatusDelivered, delivered, report, 0, db.Fence{}); err != nil {
 		t.Fatal(err)
 	}
 

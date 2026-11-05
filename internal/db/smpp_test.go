@@ -24,7 +24,7 @@ type notificationRow struct {
 func notificationRows(t *testing.T, d *DB, messageID int64) []notificationRow {
 	t.Helper()
 
-	rows, err := d.conn.QueryContext(context.Background(), `SELECT n.id, n.message_id, s.esme_id, n.type, n.tp_status,
+	rows, err := d.writer.QueryContext(context.Background(), `SELECT n.id, n.message_id, s.esme_id, n.type, n.tp_status,
 		n.attempt_id, n.expires_at, n.next_attempt_at, n.attempts, n.result
 		FROM smpp_notifications n JOIN smpp_messages s ON s.message_id = n.message_id
 		WHERE n.message_id = ? ORDER BY n.id`, messageID)
@@ -57,7 +57,7 @@ func notificationByID(t *testing.T, d *DB, id int64) notificationRow {
 	t.Helper()
 
 	var messageID int64
-	if err := d.conn.QueryRowContext(context.Background(), `SELECT message_id FROM smpp_notifications WHERE id = ?`,
+	if err := d.writer.QueryRowContext(context.Background(), `SELECT message_id FROM smpp_notifications WHERE id = ?`,
 		id).Scan(&messageID); err != nil {
 		t.Fatal(err)
 	}
@@ -163,10 +163,14 @@ func TestCompleteMessageQueuesNotifications(t *testing.T) {
 
 						var visible []int
 
-						f.d.OnNotificationsQueued(func() { visible = append(visible, len(notificationRows(t, f.d, id))) })
+						f.d.OnEvents(func(ev Events) {
+							if ev.Notifications {
+								visible = append(visible, len(notificationRows(t, f.d, id)))
+							}
+						})
 
 						at := f.origin.Add(time.Minute)
-						if err := f.d.CompleteMessage(ctx, id, s.status, at, nil, 0x42); err != nil {
+						if err := f.d.CompleteMessage(ctx, id, s.status, at, nil, 0x42, Fence{}); err != nil {
 							t.Fatalf("CompleteMessage: %v", err)
 						}
 
@@ -226,14 +230,14 @@ func TestCompleteMessageNotificationsExpireAfterTheDefaultValidity(t *testing.T)
 	ctx := context.Background()
 	f := newSMPPFixture(t)
 
-	if _, err := f.d.conn.ExecContext(ctx, `UPDATE delivery SET default_validity = ?`, int64(time.Hour)); err != nil {
+	if _, err := f.d.writer.ExecContext(ctx, `UPDATE delivery SET default_validity = ?`, int64(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 
 	id := f.submit(t, f.esme, ReceiptFinal, false)
 	at := f.origin.Add(time.Minute)
 
-	if err := f.d.CompleteMessage(ctx, id, StatusDelivered, at, nil, 0); err != nil {
+	if err := f.d.CompleteMessage(ctx, id, StatusDelivered, at, nil, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -256,7 +260,7 @@ func TestCompleteMessageQueuesNothingForOtherOrigins(t *testing.T) {
 
 	f.attempt(t, id, "success", []byte{0x00, 0x00})
 
-	if err := f.d.CompleteMessage(ctx, id, StatusFailed, f.origin, nil, 0x42); err != nil {
+	if err := f.d.CompleteMessage(ctx, id, StatusFailed, f.origin, nil, 0x42, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -272,14 +276,14 @@ func TestCompleteMessageQueuesInItsTransaction(t *testing.T) {
 	id := f.submit(t, f.esme, ReceiptFinal, true)
 	f.attempt(t, id, "success", []byte{0x00, 0x07})
 
-	if _, err := f.d.conn.ExecContext(ctx, `CREATE TRIGGER fail_receipt BEFORE INSERT ON smpp_notifications
+	if _, err := f.d.writer.ExecContext(ctx, `CREATE TRIGGER fail_receipt BEFORE INSERT ON smpp_notifications
 		WHEN NEW.type = 'receipt' BEGIN SELECT RAISE(ABORT, 'forced failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 
 	at := f.origin.Add(time.Minute)
 
-	if err := f.d.CompleteMessage(ctx, id, StatusDelivered, at, nil, 0); err == nil {
+	if err := f.d.CompleteMessage(ctx, id, StatusDelivered, at, nil, 0, Fence{}); err == nil {
 		t.Fatal("CompleteMessage succeeded")
 	}
 
@@ -291,11 +295,11 @@ func TestCompleteMessageQueuesInItsTransaction(t *testing.T) {
 		t.Fatalf("notifications = %d, want 0: the SIM answer must roll back with the receipt", n)
 	}
 
-	if _, err := f.d.conn.ExecContext(ctx, `DROP TRIGGER fail_receipt`); err != nil {
+	if _, err := f.d.writer.ExecContext(ctx, `DROP TRIGGER fail_receipt`); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := f.d.CompleteMessage(ctx, id, StatusDelivered, at, nil, 0); err != nil {
+	if err := f.d.CompleteMessage(ctx, id, StatusDelivered, at, nil, 0, Fence{}); err != nil {
 		t.Fatalf("CompleteMessage once the trigger is gone: %v", err)
 	}
 
@@ -303,7 +307,7 @@ func TestCompleteMessageQueuesInItsTransaction(t *testing.T) {
 		t.Fatalf("notifications = %+v, want 2", rows)
 	}
 
-	if err := f.d.CompleteMessage(ctx, id, StatusFailed, at, nil, 0); !errors.Is(err, ErrNotPending) {
+	if err := f.d.CompleteMessage(ctx, id, StatusFailed, at, nil, 0, Fence{}); !errors.Is(err, ErrNotPending) {
 		t.Fatalf("CompleteMessage twice = %v, want ErrNotPending", err)
 	}
 
@@ -336,7 +340,11 @@ func TestReplacedSMPPMessageGetsADeletedReceipt(t *testing.T) {
 
 			var visible []int
 
-			f.d.OnNotificationsQueued(func() { visible = append(visible, len(notificationRows(t, f.d, id))) })
+			f.d.OnEvents(func(ev Events) {
+				if ev.Notifications {
+					visible = append(visible, len(notificationRows(t, f.d, id)))
+				}
+			})
 
 			replacedAt := f.origin.Add(time.Minute)
 
@@ -373,7 +381,7 @@ func TestReplacedSMPPMessageGetsADeletedReceipt(t *testing.T) {
 				t.Fatalf("receipt = %+v, want TP-Status 2", n)
 			}
 
-			if due, err := f.d.DueNotifications(ctx, f.esme, replacedAt, nil, 10); err != nil || len(due) != 1 ||
+			if due, err := dueNotifications(ctx, f.d.reader(), f.esme, replacedAt, 10); err != nil || len(due) != 1 ||
 				due[0].MessageState != 4 {
 				t.Fatalf("DueNotifications = %+v, %v; want DELETED (4)", due, err)
 			}
@@ -405,17 +413,17 @@ func TestDueNotifications(t *testing.T) {
 	f.attempt(t, answered, "success", report)
 
 	t0 := f.origin.Add(time.Minute)
-	if err := d.CompleteMessage(ctx, answered, StatusDelivered, t0, nil, 0); err != nil {
+	if err := d.CompleteMessage(ctx, answered, StatusDelivered, t0, nil, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
 	failed := f.submit(t, f.esme, ReceiptFailure, false)
-	if err := d.CompleteMessage(ctx, failed, StatusFailed, t0.Add(time.Second), nil, 0x42); err != nil {
+	if err := d.CompleteMessage(ctx, failed, StatusFailed, t0.Add(time.Second), nil, 0x42, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
 	other := f.submit(t, otherESME, ReceiptFinal, false)
-	if err := d.CompleteMessage(ctx, other, StatusDelivered, t0, nil, 0); err != nil {
+	if err := d.CompleteMessage(ctx, other, StatusDelivered, t0, nil, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -427,10 +435,10 @@ func TestDueNotifications(t *testing.T) {
 
 	simAnswer, answerReceipt, failedReceipt := answerRows[0].ID, answerRows[1].ID, failedRows[0].ID
 
-	ids := func(t *testing.T, esme int64, now time.Time, exclude []int64, limit int) []int64 {
+	ids := func(t *testing.T, esme int64, now time.Time, limit int) []int64 {
 		t.Helper()
 
-		ns, err := d.DueNotifications(ctx, esme, now, exclude, limit)
+		ns, err := dueNotifications(ctx, d.reader(), esme, now, limit)
 		if err != nil {
 			t.Fatalf("DueNotifications: %v", err)
 		}
@@ -446,35 +454,32 @@ func TestDueNotifications(t *testing.T) {
 	later := t0.Add(time.Minute)
 
 	tests := []struct {
-		name    string
-		esme    int64
-		now     time.Time
-		exclude []int64
-		limit   int
-		want    []int64
+		name  string
+		esme  int64
+		now   time.Time
+		limit int
+		want  []int64
 	}{
-		{"before completion", f.esme, t0.Add(-time.Nanosecond), nil, 10, []int64{}},
-		{"at the first completion", f.esme, t0, nil, 10, []int64{simAnswer}},
-		{"the receipt waits for the SIM answer", f.esme, later, nil, 10, []int64{simAnswer, failedReceipt}},
-		{"limit", f.esme, later, nil, 1, []int64{simAnswer}},
-		{"in flight left out", f.esme, later, []int64{simAnswer}, 10, []int64{failedReceipt}},
-		{"several in flight", f.esme, later, []int64{simAnswer, failedReceipt}, 10, []int64{}},
-		{"another ESME", otherESME, later, nil, 10, []int64{otherRows[0].ID}},
-		{"an unknown ESME", 42, later, nil, 10, []int64{}},
-		{"expired", f.esme, t0.Add(defaultValidity + time.Second), nil, 10, []int64{}},
-		{"at expiry", f.esme, t0.Add(defaultValidity), nil, 10, []int64{failedReceipt}},
+		{"before completion", f.esme, t0.Add(-time.Nanosecond), 10, []int64{}},
+		{"at the first completion", f.esme, t0, 10, []int64{simAnswer}},
+		{"the receipt waits for the SIM answer", f.esme, later, 10, []int64{simAnswer, failedReceipt}},
+		{"limit", f.esme, later, 1, []int64{simAnswer}},
+		{"another ESME", otherESME, later, 10, []int64{otherRows[0].ID}},
+		{"an unknown ESME", 42, later, 10, []int64{}},
+		{"expired", f.esme, t0.Add(defaultValidity + time.Second), 10, []int64{}},
+		{"at expiry", f.esme, t0.Add(defaultValidity), 10, []int64{failedReceipt}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ids(t, tt.esme, tt.now, tt.exclude, tt.limit); !reflect.DeepEqual(got, tt.want) {
+			if got := ids(t, tt.esme, tt.now, tt.limit); !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("DueNotifications = %v, want %v", got, tt.want)
 			}
 		})
 	}
 
 	t.Run("contents", func(t *testing.T) {
-		ns, err := d.DueNotifications(ctx, f.esme, later, nil, 10)
+		ns, err := dueNotifications(ctx, d.reader(), f.esme, later, 10)
 		if err != nil || len(ns) != 2 {
 			t.Fatalf("DueNotifications = %+v, %v", ns, err)
 		}
@@ -506,18 +511,18 @@ func TestDueNotifications(t *testing.T) {
 		id := g.submit(t, g.esme, ReceiptNone, true)
 		g.attempt(t, id, "error", report)
 
-		if err := g.d.CompleteMessage(ctx, id, StatusFailed, t0, nil, 0); err != nil {
+		if err := g.d.CompleteMessage(ctx, id, StatusFailed, t0, nil, 0, Fence{}); err != nil {
 			t.Fatal(err)
 		}
 
-		ns, err := g.d.DueNotifications(ctx, g.esme, t0, nil, 10)
+		ns, err := dueNotifications(ctx, g.d.reader(), g.esme, t0, 10)
 		if err != nil || len(ns) != 1 || ns[0].Ack || !bytes.Equal(ns[0].DeliverReport, report) {
 			t.Fatalf("DueNotifications = %+v, %v; want one SIM answer without Ack", ns, err)
 		}
 	})
 
 	retryAt := later.Add(10 * time.Minute)
-	if err := d.RetryNotification(ctx, failedReceipt, retryAt); err != nil {
+	if err := d.RetryNotification(ctx, failedReceipt, retryAt, ""); err != nil {
 		t.Fatalf("RetryNotification: %v", err)
 	}
 
@@ -525,12 +530,12 @@ func TestDueNotifications(t *testing.T) {
 		t.Fatalf("after RetryNotification = %+v", n)
 	}
 
-	if got := ids(t, f.esme, later, nil, 10); !reflect.DeepEqual(got, []int64{simAnswer}) {
+	if got := ids(t, f.esme, later, 10); !reflect.DeepEqual(got, []int64{simAnswer}) {
 		t.Fatalf("DueNotifications after a retry = %v, want only the SIM answer", got)
 	}
 
-	if ns, err := d.DueNotifications(ctx, f.esme, retryAt, []int64{simAnswer}, 10); err != nil || len(ns) != 1 ||
-		ns[0].ID != failedReceipt || ns[0].Attempts != 1 {
+	if ns, err := dueNotifications(ctx, d.reader(), f.esme, retryAt, 10); err != nil || len(ns) != 2 ||
+		ns[1].ID != failedReceipt || ns[1].Attempts != 1 {
 		t.Fatalf("DueNotifications once the retry is due = %+v, %v", ns, err)
 	}
 
@@ -538,7 +543,7 @@ func TestDueNotifications(t *testing.T) {
 		t.Fatalf("CloseNotification: %v", err)
 	}
 
-	if got := ids(t, f.esme, later.Add(time.Second), nil, 10); !reflect.DeepEqual(got, []int64{answerReceipt}) {
+	if got := ids(t, f.esme, later.Add(time.Second), 10); !reflect.DeepEqual(got, []int64{answerReceipt}) {
 		t.Fatalf("DueNotifications after the SIM answer = %v, want its receipt", got)
 	}
 
@@ -550,7 +555,7 @@ func TestDueNotifications(t *testing.T) {
 		t.Fatalf("CloseNotification of an unknown ID = %v, want ErrNotFound", err)
 	}
 
-	if err := d.RetryNotification(ctx, simAnswer, retryAt); err != nil {
+	if err := d.RetryNotification(ctx, simAnswer, retryAt, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -569,7 +574,7 @@ func TestCloseNotification(t *testing.T) {
 			f := newSMPPFixture(t)
 
 			id := f.submit(t, f.esme, ReceiptFinal, false)
-			if err := f.d.CompleteMessage(ctx, id, StatusDelivered, f.origin, nil, 0); err != nil {
+			if err := f.d.CompleteMessage(ctx, id, StatusDelivered, f.origin, nil, 0, Fence{}); err != nil {
 				t.Fatal(err)
 			}
 
@@ -612,7 +617,7 @@ func TestExpireAndCountNotifications(t *testing.T) {
 		id := f.submit(t, esme, receipt, simAnswer)
 		f.attempt(t, id, "success", []byte{0x00, 0x07})
 
-		if err := d.CompleteMessage(ctx, id, StatusDelivered, at, nil, 0); err != nil {
+		if err := d.CompleteMessage(ctx, id, StatusDelivered, at, nil, 0, Fence{}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -637,7 +642,7 @@ func TestExpireAndCountNotifications(t *testing.T) {
 	}
 
 	thirdReceipt := notificationRows(t, d, third)[0].ID
-	if err := d.RetryNotification(ctx, thirdReceipt, t0.Add(30*24*time.Hour)); err != nil {
+	if err := d.RetryNotification(ctx, thirdReceipt, t0.Add(30*24*time.Hour), ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -744,14 +749,14 @@ func TestPurgeKeepsMessagesWithNotificationsToSend(t *testing.T) {
 			f.origin = before.Add(-time.Hour)
 
 			if tt.validity != 0 {
-				if _, err := f.d.conn.ExecContext(ctx, `UPDATE delivery SET default_validity = ?`,
+				if _, err := f.d.writer.ExecContext(ctx, `UPDATE delivery SET default_validity = ?`,
 					int64(tt.validity)); err != nil {
 					t.Fatal(err)
 				}
 			}
 
 			id := f.submit(t, f.esme, ReceiptFinal, false)
-			if err := f.d.CompleteMessage(ctx, id, StatusDelivered, before, nil, 0); err != nil {
+			if err := f.d.CompleteMessage(ctx, id, StatusDelivered, before, nil, 0, Fence{}); err != nil {
 				t.Fatal(err)
 			}
 

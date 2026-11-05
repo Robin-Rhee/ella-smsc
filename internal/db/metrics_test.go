@@ -46,7 +46,7 @@ func TestMetricsCountFailuresOnly(t *testing.T) {
 		t.Errorf("duration has %d observations, want 4", got)
 	}
 
-	if err := d.conn.Close(); err != nil {
+	if err := d.reader().Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -100,7 +100,11 @@ func TestMetricsLint(t *testing.T) {
 }
 
 func TestEveryCallIsObserved(t *testing.T) {
-	unobserved := map[string]bool{"Close": true, "Collectors": true, "CreateMessage": true, "OnNotificationsQueued": true, "Ping": true}
+	unobserved := map[string]bool{
+		"Close": true, "Collectors": true, "CreateMessage": true, "Ping": true, "Apply": true, "ApplyEntries": true, "AppliedIndex": true, "WaitApplied": true,
+		"OnEvents": true, "SetProposer": true, "RecordConfiguration": true, "MakeDurable": true, "ResetPosition": true, "JWTSecret": true, "OIDCCookieKey": true,
+		"HashAt": true, "LeaderTime": true, "Schema": true, "RegisterMember": true, "Secrets": true,
+	}
 
 	files, err := filepath.Glob("*.go")
 	if err != nil {
@@ -200,7 +204,7 @@ func TestMetricsCountWhatMessagesBecome(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := d.CompleteMessage(ctx, delivered, StatusDelivered, now, testReport(now), 0); err != nil {
+	if err := d.CompleteMessage(ctx, delivered, StatusDelivered, now, testReport(now), 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -209,28 +213,23 @@ func TestMetricsCountWhatMessagesBecome(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := d.ScheduleRetry(ctx, retried, now, now, false); err != nil {
+	if err := d.ScheduleRetry(ctx, retried, now, now, false, time.Time{}, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
 	if err := d.CompleteMessage(ctx, retried, StatusFailed, now, &NewStatusReport{
 		Originator: testServiceCentre, Status: 0x62, TPDU: []byte{0x06}, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
-	}, 0); err != nil {
+	}, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
-	replaced, err := d.CreateMessage(ctx, replaceType(testMessage(3, false, []byte{0x03}, now)))
+	replaced, err := d.CreateMessage(ctx, replaceType(testMessage(3, false, reportedSubmit(t, 3), now)))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	replacement := replaceType(testMessage(4, false, []byte{0x04}, now))
-	replacement.ReportReplaced = func(Message) (*NewStatusReport, error) {
-		r := testReport(now)
-		r.Status = 0x02
-
-		return r, nil
-	}
+	replacement := replaceType(testMessage(4, false, reportedSubmit(t, 4), now))
+	replacement.ReportReplaced = true
 
 	if _, err := d.CreateMessage(ctx, replacement); err != nil {
 		t.Fatal(err)
@@ -241,7 +240,7 @@ func TestMetricsCountWhatMessagesBecome(t *testing.T) {
 		t.Fatalf("reports = %+v, %v", reports, err)
 	}
 
-	if err := d.CompleteMessage(ctx, reports[0].ID, StatusDelivered, now, nil, 0); err != nil {
+	if err := d.CompleteMessage(ctx, reports[0].ID, StatusDelivered, now, nil, 0, Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -256,7 +255,7 @@ func TestMetricsCountWhatMessagesBecome(t *testing.T) {
 		t.Fatalf("counts = %v, want %v", got, want)
 	}
 
-	if err := d.CompleteMessage(ctx, replaced, StatusDelivered, now, nil, 0); !errors.Is(err, ErrNotPending) {
+	if err := d.CompleteMessage(ctx, replaced, StatusDelivered, now, nil, 0, Fence{}); !errors.Is(err, ErrNotPending) {
 		t.Fatalf("err = %v, want ErrNotPending", err)
 	}
 
@@ -268,7 +267,7 @@ func TestMetricsCountWhatMessagesBecome(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := d.CompleteMessage(ctx, id, StatusDelivered, now, testReport(now), 0); !errors.Is(err, ErrNotFound) {
+	if err := d.CompleteMessage(ctx, id, StatusDelivered, now, testReport(now), 0, Fence{}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 

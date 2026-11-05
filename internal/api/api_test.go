@@ -78,8 +78,8 @@ func testConfig(t *testing.T, store *db.DB) api.Config {
 		Auth:          store,
 		ESMEs:         store,
 		OIDC:          testOIDC(t, store),
-		JWTSecret:     testJWTSecret,
-		OIDCCookieKey: []byte("fedcba9876543210fedcba9876543210"),
+		JWTSecret:     func() []byte { return testJWTSecret },
+		OIDCCookieKey: func() []byte { return []byte("fedcba9876543210fedcba9876543210") },
 		BcryptCost:    bcrypt.MinCost,
 		Now:           func() time.Time { return testNow },
 		Logger:        slog.New(slog.DiscardHandler),
@@ -135,8 +135,14 @@ func serve(h http.Handler, req *http.Request) *httptest.ResponseRecorder {
 	return rec
 }
 
+const testNodeID = "01a1ac75-e354-762b-b38f-013c0a7ca824"
+
 func testSettings(t *testing.T, store *db.DB) settings.Settings {
 	t.Helper()
+
+	if err := store.RegisterMember(context.Background(), db.Member{NodeID: testNodeID, Version: "v"}); err != nil {
+		t.Fatal(err)
+	}
 
 	s, err := store.GetSettings(context.Background())
 	if err != nil {
@@ -479,7 +485,7 @@ func TestGetMessageContentRefusals(t *testing.T) {
 	if err := a.store.CompleteMessage(ctx, m, db.StatusDelivered, testNow, &db.NewStatusReport{
 		Originator: db.Address{Digits: "15550000000", TypeOfNumber: 1, NumberingPlan: 1}, TPDU: []byte{0x06},
 		CreatedAt: testNow, ExpiresAt: testNow.Add(time.Hour),
-	}, 0); err != nil {
+	}, 0, db.Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -668,7 +674,7 @@ func TestListMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := a.store.CompleteMessage(context.Background(), 3, db.StatusDelivered, testNow, nil, 0); err != nil {
+	if err := a.store.CompleteMessage(context.Background(), 3, db.StatusDelivered, testNow, nil, 0, db.Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -792,11 +798,11 @@ func TestCountMessages(t *testing.T) {
 		}
 	}
 
-	if err := a.store.CompleteMessage(context.Background(), 1, db.StatusDelivered, testNow, nil, 0); err != nil {
+	if err := a.store.CompleteMessage(context.Background(), 1, db.StatusDelivered, testNow, nil, 0, db.Fence{}); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := a.store.CompleteMessage(context.Background(), 2, db.StatusFailed, testNow, nil, 0); err != nil {
+	if err := a.store.CompleteMessage(context.Background(), 2, db.StatusFailed, testNow, nil, 0, db.Fence{}); err != nil {
 		t.Fatal(err)
 	}
 

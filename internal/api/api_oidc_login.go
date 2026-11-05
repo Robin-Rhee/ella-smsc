@@ -87,7 +87,7 @@ func StartOIDCLogin(a *auth) http.Handler {
 
 		l := c.NewLogin(cfg.Now())
 
-		value, err := oidc.Seal(cfg.OIDCCookieKey, OIDCLoginCookieName, l)
+		value, err := oidc.Seal(cfg.OIDCCookieKey(), OIDCLoginCookieName, l)
 		if err != nil {
 			a.oidcDone(w, r, "", err)
 			return
@@ -148,7 +148,7 @@ func (a *auth) oidcAuthenticate(r *http.Request) (*oidc.Client, oidc.Claims, err
 		return nil, oidc.Claims{}, refuse(OIDCFailed, "no login in progress")
 	}
 
-	l, err := oidc.Open(cfg.OIDCCookieKey, OIDCLoginCookieName, cookie.Value, cfg.Now())
+	l, err := oidc.Open(cfg.OIDCCookieKey(), OIDCLoginCookieName, cookie.Value, cfg.Now())
 	if err != nil {
 		return nil, oidc.Claims{}, refuse(OIDCFailed, "%v", err)
 	}
@@ -265,7 +265,6 @@ func (a *auth) oidcLogIn(w http.ResponseWriter, r *http.Request, c *oidc.Client,
 		a.audit(r, "update_user", u.Email, fmt.Sprintf("Role %d from the identity provider not applied to %s, the last admin with a password", role, u.Email))
 	case res.RoleChanged():
 		a.audit(r, "update_user", u.Email, fmt.Sprintf("Role of %s set to %d from the identity provider", u.Email, u.Role))
-		a.roleChanged(r.Context(), u)
 	}
 
 	a.setSessionCookie(w, raw, s.ExpiresAt)

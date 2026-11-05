@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,6 +16,7 @@ const (
 	defaultDiameterPort = 3868
 	defaultAPIPort      = 5010
 	defaultSMPPPort     = 2775
+	defaultClusterPort  = 7000
 )
 
 type Config struct {
@@ -24,6 +25,7 @@ type Config struct {
 	API       API       `yaml:"api"`
 	Diameter  Diameter  `yaml:"diameter"`
 	SMPP      *SMPP     `yaml:"smpp"`
+	Cluster   *Cluster  `yaml:"cluster"`
 	Telemetry Telemetry `yaml:"telemetry"`
 }
 
@@ -36,10 +38,9 @@ type DB struct {
 }
 
 type API struct {
-	Address    netip.Addr    `yaml:"address"`
-	Port       int           `yaml:"port"`
-	TLS        *TLS          `yaml:"tls"`
-	DrainDelay time.Duration `yaml:"drain_delay"`
+	Address netip.Addr `yaml:"address"`
+	Port    int        `yaml:"port"`
+	TLS     *TLS       `yaml:"tls"`
 }
 
 type TLS struct {
@@ -51,6 +52,20 @@ type SMPP struct {
 	Address netip.Addr `yaml:"address"`
 	Port    int        `yaml:"port"`
 	TLS     *TLS       `yaml:"tls"`
+}
+
+type Cluster struct {
+	Address   netip.Addr `yaml:"address"`
+	Port      int        `yaml:"port"`
+	Advertise string     `yaml:"advertise"`
+}
+
+func (c Cluster) AdvertiseAddress() string {
+	if c.Advertise != "" {
+		return c.Advertise
+	}
+
+	return netip.AddrPortFrom(c.Address, uint16(c.Port)).String()
 }
 
 type Telemetry struct {
@@ -90,6 +105,12 @@ func Load(path string) (Config, error) {
 		cfg.SMPP.Port = defaultSMPPPort
 	}
 
+	if c := cfg.Cluster; c != nil {
+		if c.Port == 0 {
+			c.Port = defaultClusterPort
+		}
+	}
+
 	if err := cfg.validate(); err != nil {
 		return Config{}, err
 	}
@@ -105,8 +126,6 @@ func (c Config) validate() error {
 		return errors.New("api.address is required")
 	case c.API.Port < 1 || c.API.Port > 65535:
 		return fmt.Errorf("api.port %d is out of range", c.API.Port)
-	case c.API.DrainDelay < 0:
-		return fmt.Errorf("api.drain_delay %s is negative", c.API.DrainDelay)
 	case c.Diameter.Name != "" && c.Diameter.Address.IsValid():
 		return errors.New("diameter.name and diameter.address cannot both be set")
 	case c.Diameter.Name == "" && !c.Diameter.Address.IsValid():
@@ -136,6 +155,38 @@ func (c Config) validate() error {
 		if err := s.TLS.validate("smpp"); err != nil {
 			return err
 		}
+	}
+
+	if c := c.Cluster; c != nil {
+		if err := c.validate(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c Cluster) validate() error {
+	switch {
+	case !c.Address.IsValid():
+		return errors.New("cluster.address is required")
+	case c.Port < 1 || c.Port > 65535:
+		return fmt.Errorf("cluster.port %d is out of range", c.Port)
+	case c.Advertise == "" && c.Address.IsUnspecified():
+		return errors.New("cluster.advertise is required when cluster.address is unspecified")
+	}
+
+	if c.Advertise == "" {
+		return nil
+	}
+
+	host, port, err := net.SplitHostPort(c.Advertise)
+	if err != nil || host == "" || port == "" {
+		return fmt.Errorf("cluster.advertise %q is not a host:port", c.Advertise)
+	}
+
+	if ip, err := netip.ParseAddr(host); err == nil && ip.IsUnspecified() {
+		return fmt.Errorf("cluster.advertise %q must be a specific address", c.Advertise)
 	}
 
 	return nil

@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 const validConfig = `logging:
@@ -92,8 +91,6 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 		"missing api address":       {"  address: 127.0.0.1\n", ""},
 		"api port out of range":     {"port: 8080", "port: 70000"},
 		"invalid api address":       {"  address: 127.0.0.1\n", "  address: localhost\n"},
-		"negative drain delay":      {"  port: 8080\n", "  port: 8080\n  drain_delay: -1s\n"},
-		"drain delay without unit":  {"  port: 8080\n", "  port: 8080\n  drain_delay: 5\n"},
 	}
 
 	for name, edit := range tests {
@@ -168,17 +165,6 @@ func TestLoadAPIDefaultPort(t *testing.T) {
 	}
 }
 
-func TestLoadAPIDrainDelay(t *testing.T) {
-	cfg, err := Load(writeConfig(t, strings.Replace(validConfig, "  port: 8080\n", "  port: 8080\n  drain_delay: 5s\n", 1)))
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-
-	if cfg.API.DrainDelay != 5*time.Second {
-		t.Fatalf("API.DrainDelay = %s", cfg.API.DrainDelay)
-	}
-}
-
 func TestLoadSMPP(t *testing.T) {
 	dir := t.TempDir()
 	cert, key := filepath.Join(dir, "smpp.pem"), filepath.Join(dir, "smpp.key")
@@ -243,5 +229,33 @@ func TestLoadTelemetry(t *testing.T) {
 
 	if _, err := Load(writeConfig(t, validConfig+"telemetry:\n  enabled: true\n")); err == nil {
 		t.Fatal("Load without telemetry.otlp_endpoint succeeded")
+	}
+}
+
+func TestLoadCluster(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validConfig+"cluster:\n  address: 10.0.0.1\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := cfg.Cluster
+	if c == nil || c.Port != defaultClusterPort || c.AdvertiseAddress() != "10.0.0.1:7000" {
+		t.Fatalf("cluster = %+v", c)
+	}
+
+	cfg, err = Load(writeConfig(t, validConfig+"cluster:\n  address: 0.0.0.0\n  advertise: smsc-0.smsc:7000\n"))
+	if err != nil || cfg.Cluster.AdvertiseAddress() != "smsc-0.smsc:7000" {
+		t.Fatalf("cluster = %+v, %v", cfg.Cluster, err)
+	}
+
+	for name, block := range map[string]string{
+		"no address":             "cluster:\n  port: 7000\n",
+		"unspecified, no advert": "cluster:\n  address: 0.0.0.0\n",
+		"advertise without port": "cluster:\n  address: 10.0.0.1\n  advertise: smsc-0\n",
+		"unspecified advertise":  "cluster:\n  address: 10.0.0.1\n  advertise: 0.0.0.0:7000\n",
+	} {
+		if _, err := Load(writeConfig(t, validConfig+block)); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
 	}
 }

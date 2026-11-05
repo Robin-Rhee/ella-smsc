@@ -3,13 +3,18 @@ package api
 import (
 	"net/http"
 
+	"github.com/ellanetworks/smsc/internal/settings"
 	"github.com/ellanetworks/smsc/version"
 )
 
 type Status struct {
-	Version     string `json:"version"`
-	Revision    string `json:"revision"`
-	Initialized bool   `json:"initialized"`
+	Version       string `json:"version"`
+	Revision      string `json:"revision"`
+	Initialized   bool   `json:"initialized"`
+	Clustered     bool   `json:"clustered"`
+	NodeID        string `json:"node_id"`
+	DisplayName   string `json:"display_name"`
+	DiameterLabel string `json:"diameter_label"`
 }
 
 func GetStatus(cfg Config) http.Handler {
@@ -21,6 +26,17 @@ func GetStatus(cfg Config) http.Handler {
 		}
 
 		v := version.Get()
-		writeResponse(w, r, Status{Version: v.Version, Revision: v.Revision, Initialized: n > 0}, http.StatusOK, cfg.Logger)
+		st := Status{
+			Version: v.Version, Revision: v.Revision, Initialized: n > 0,
+			Clustered: cfg.Cluster != nil && cfg.Cluster.Clustered(),
+		}
+
+		if cfg.Cluster != nil {
+			st.NodeID = cfg.Cluster.ID()
+			st.DisplayName = cfg.Cluster.DisplayName(r.Context())
+			st.DiameterLabel = settings.NodeLabel(st.NodeID)
+		}
+
+		writeResponse(w, r, st, http.StatusOK, cfg.Logger)
 	})
 }

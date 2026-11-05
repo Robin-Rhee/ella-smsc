@@ -10,8 +10,10 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +21,7 @@ import (
 	"github.com/ellanetworks/core/diameter/s6c"
 	"github.com/ellanetworks/core/diameter/sgd"
 	"github.com/ellanetworks/smsc/internal/api"
+	"github.com/ellanetworks/smsc/internal/cluster"
 	"github.com/ellanetworks/smsc/internal/config"
 	"github.com/ellanetworks/smsc/internal/db"
 	"github.com/ellanetworks/smsc/internal/delivery"
@@ -55,14 +58,14 @@ type Server struct {
 	stopFollowing context.CancelFunc
 	apiServer     *http.Server
 	apiListener   net.Listener
-	stopDelivery  context.CancelFunc
-	deliveryDone  chan struct{}
-	stopPurging   context.CancelFunc
-	purgeDone     chan struct{}
+	node          *cluster.Node
+	deliverer     *delivery.Deliverer
+	esmes         *esme.Service
+	drain         *drainer
+	stopLeading   context.CancelFunc
+	engines       sync.WaitGroup
 	smppServer    *smpp.Server
 	smppListener  net.Listener
-	stopSMPP      context.CancelFunc
-	smppDone      chan struct{}
 }
 
 const tracingShutdownTimeout = 5 * time.Second
@@ -118,32 +121,55 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		return err
 	}
 
-	initial, err := database.GetSettings(ctx)
+	clusterCfg := cluster.Config{
+		Dir: filepath.Join(filepath.Dir(cfg.DB.Path), "raft"), Version: version.Get().Version, Now: time.Now,
+		Logger: s.Logger,
+	}
+
+	if c := cfg.Cluster; c != nil {
+		clusterCfg.Address = netip.AddrPortFrom(c.Address, uint16(c.Port)).String()
+		clusterCfg.Advertise = c.AdvertiseAddress()
+	}
+
+	node, err := cluster.Open(ctx, clusterCfg, database)
 	if err != nil {
 		_ = database.Close()
 		return err
 	}
 
-	jwtSecret, err := database.JWTSecret(ctx)
+	database.SetProposer(node)
+
+	closeStore := func() {
+		if err := errors.Join(node.Close(), database.Close()); err != nil {
+			s.Logger.ErrorContext(ctx, "failed to close the database", slog.Any("error", err))
+		}
+	}
+
+	initial, err := database.GetSettings(ctx)
 	if err != nil {
-		_ = database.Close()
+		closeStore()
+		return err
+	}
+
+	secrets, err := newSecrets(ctx, database)
+	if err != nil {
+		closeStore()
 		return err
 	}
 
 	oidcSettings, err := database.GetOIDC(ctx)
 	if err != nil {
-		_ = database.Close()
-		return err
-	}
-
-	oidcCookieKey, err := database.OIDCCookieKey(ctx)
-	if err != nil {
-		_ = database.Close()
+		closeStore()
 		return err
 	}
 
 	live := settings.NewLive(database, initial)
-	m := newMetrics(database)
+
+	m, err := newMetrics(database, node)
+	if err != nil {
+		closeStore()
+		return err
+	}
 
 	mux := diameter.NewMux()
 
@@ -154,6 +180,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		metrics:        m.peers,
 		tracerProvider: tp,
 		logger:         s.Logger,
+		label:          settings.NodeLabel(node.ID()),
 	}
 
 	if tp == nil {
@@ -190,11 +217,22 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		Received:       m.received,
 		Metrics:        m.smpp,
 		BcryptCost:     s.bcryptCost,
+		Node:           node.ID(),
 		TracerProvider: tp,
 		Now:            time.Now,
 		Logger:         s.Logger,
 	}
-	database.OnNotificationsQueued(esmes.NotificationsQueued)
+
+	s.drain = &drainer{
+		node: node, store: database, esmes: esmes, logger: s.Logger,
+		wake: make(chan struct{}, 1),
+	}
+
+	oidcLive := oidc.NewLive(database, oidcSettings)
+
+	database.OnEvents(func(ev db.Events) {
+		s.applyEvents(context.WithoutCancel(ctx), ev, database, live, oidcLive, deliverer, esmes, secrets)
+	})
 
 	mux.Handle(sgd.ApplicationID, sgd.CommandMOForwardShortMessage, &smscsgd.Handler{
 		Identity: nodes.Identity,
@@ -213,7 +251,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	})
 
 	if err := nodes.start(ctx, initial.Operator, initial.Peers); err != nil {
-		_ = database.Close()
+		closeStore()
 		return err
 	}
 
@@ -223,7 +261,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	if err != nil {
 		nodes.shutdown(ctx)
 
-		_ = database.Close()
+		closeStore()
 
 		return fmt.Errorf("listen for the API: %w", err)
 	}
@@ -238,15 +276,17 @@ func (s *Server) Start(ctx context.Context) (err error) {
 			Submitter:      submitter,
 			Notify:         deliverer.Notify,
 			ESMEs:          database,
-			OIDC:           oidc.NewLive(database, oidcSettings),
-			SMPP:           smppSessions{esmes},
-			Ready:          func(ctx context.Context) error { return s.ready(ctx, database) },
+			OIDC:           oidcLive,
+			Backups:        node,
+			Cluster:        node,
+			SMPP:           smppSessions{database},
+			Ready:          func(ctx context.Context) error { return s.ready(ctx, database, node) },
 			Received:       m.received,
 			Metrics:        m.registry,
 			Requests:       m.requests,
 			Auth:           database,
-			JWTSecret:      jwtSecret,
-			OIDCCookieKey:  oidcCookieKey,
+			JWTSecret:      secrets.jwt,
+			OIDCCookieKey:  secrets.cookieKey,
 			BcryptCost:     s.bcryptCost,
 			SecureCookie:   tlsConfig != nil,
 			TracerProvider: tp,
@@ -270,12 +310,12 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	base := context.WithoutCancel(ctx)
 
 	if cfg.SMPP != nil {
-		if err := s.startSMPP(ctx, base, esmes, smppTLS); err != nil {
+		if err := s.startSMPP(ctx, esmes, smppTLS); err != nil {
 			_ = s.apiServer.Close()
 
 			nodes.shutdown(ctx)
 
-			_ = database.Close()
+			closeStore()
 
 			return err
 		}
@@ -284,16 +324,11 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	followCtx, stopFollowing := context.WithCancel(base)
 	go nodes.follow(followCtx, live)
 
-	deliveryCtx, stopDelivery := context.WithCancel(base)
-	deliveryDone := make(chan struct{})
+	if cfg.SMPP != nil {
+		go esmes.RunSessions(followCtx)
+		go esmes.Run(followCtx)
+	}
 
-	go func() {
-		deliverer.Run(deliveryCtx)
-		close(deliveryDone)
-	}()
-
-	purgeCtx, stopPurging := context.WithCancel(base)
-	purgeDone := make(chan struct{})
 	p := &purger{
 		store:    database,
 		settings: live.Get,
@@ -306,19 +341,42 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		p.now = time.Now
 	}
 
-	go func() {
-		p.run(purgeCtx)
-		close(purgeDone)
-	}()
+	leadCtx, stopLeading := context.WithCancel(base)
+
+	node.Lead(func(ctx context.Context, term uint64) {
+		s.engines.Add(1)
+		defer s.engines.Done()
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		stop := context.AfterFunc(leadCtx, cancel)
+		defer stop()
+
+		var wg sync.WaitGroup
+
+		wg.Go(func() { deliverer.Run(ctx, term) })
+		wg.Go(func() { p.run(ctx) })
+
+		wg.Go(func() { cleanSessions(ctx, database, s.Logger) })
+		wg.Go(func() { expireNotifications(ctx, esmes) })
+		wg.Go(func() { dropLostSMPPSessions(ctx, node, database, s.Logger) })
+
+		wg.Wait()
+	})
+
+	go s.fenceOnRemoval(base, node, nodes, s.smppServer)
+
+	go s.drain.run(followCtx)
 
 	s.database = database
+	s.deliverer = deliverer
+	s.esmes = esmes
+	s.node = node
 	s.shutdownTracing = shutdownTracing
 	s.nodes = nodes
 	s.stopFollowing = stopFollowing
-	s.stopDelivery = stopDelivery
-	s.deliveryDone = deliveryDone
-	s.stopPurging = stopPurging
-	s.purgeDone = purgeDone
+	s.stopLeading = stopLeading
 
 	v := version.Get()
 
@@ -334,7 +392,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	return nil
 }
 
-func (s *Server) startSMPP(ctx, base context.Context, esmes *esme.Service, tlsConfig *tls.Config) error {
+func (s *Server) startSMPP(ctx context.Context, esmes *esme.Service, tlsConfig *tls.Config) error {
 	srv, err := smpp.NewServer(smpp.ServerConfig{
 		SystemID:      smppSystemID,
 		TLS:           tlsConfig,
@@ -362,15 +420,7 @@ func (s *Server) startSMPP(ctx, base context.Context, esmes *esme.Service, tlsCo
 
 	go func() { _ = srv.Serve(ln) }()
 
-	dispatchCtx, stop := context.WithCancel(base)
-	done := make(chan struct{})
-
-	go func() {
-		esmes.Run(dispatchCtx)
-		close(done)
-	}()
-
-	s.smppServer, s.smppListener, s.stopSMPP, s.smppDone = srv, ln, stop, done
+	s.smppServer, s.smppListener = srv, ln
 
 	return nil
 }
@@ -408,17 +458,7 @@ func (s *Server) Shutdown(ctx context.Context) {
 
 	s.draining.Store(true)
 
-	s.stopDelivery()
-	s.stopPurging()
-
-	if d := s.Config.API.DrainDelay; d > 0 {
-		s.Logger.InfoContext(ctx, "draining the API", slog.Duration("delay", d))
-
-		select {
-		case <-time.After(d):
-		case <-ctx.Done():
-		}
-	}
+	s.stopLeading()
 
 	s.stopFollowing()
 
@@ -429,32 +469,31 @@ func (s *Server) Shutdown(ctx context.Context) {
 		}
 
 		cancel()
-		s.stopSMPP()
-
-		select {
-		case <-s.smppDone:
-		case <-ctx.Done():
-		}
 	}
 
 	if err := s.apiServer.Shutdown(ctx); err != nil {
 		s.Logger.WarnContext(ctx, "failed to stop the API cleanly", slog.Any("error", err))
 	}
 
-	select {
-	case <-s.deliveryDone:
-	case <-ctx.Done():
-		s.Logger.WarnContext(ctx, "shutting down with short message deliveries still in flight")
-	}
+	engines := make(chan struct{})
+
+	go func() {
+		s.engines.Wait()
+		close(engines)
+	}()
 
 	select {
-	case <-s.purgeDone:
+	case <-engines:
 	case <-ctx.Done():
+	}
+
+	if err := errors.Join(s.deliverer.Wait(ctx), s.esmes.Wait(ctx)); err != nil {
+		s.Logger.WarnContext(ctx, "shutting down with short message deliveries still in flight")
 	}
 
 	s.nodes.shutdown(ctx)
 
-	if err := s.database.Close(); err != nil {
+	if err := errors.Join(s.node.Close(), s.database.Close()); err != nil {
 		s.Logger.ErrorContext(ctx, "failed to close the database", slog.Any("error", err))
 	}
 
@@ -484,9 +523,13 @@ func (s *Server) newTracerProvider(ctx context.Context) (trace.TracerProvider, f
 	return tp, tp.Shutdown, nil
 }
 
-func (s *Server) ready(ctx context.Context, database *db.DB) error {
+func (s *Server) ready(ctx context.Context, database *db.DB, node *cluster.Node) error {
 	if s.draining.Load() {
 		return errors.New("shutting down")
+	}
+
+	if err := node.Ready(); err != nil {
+		return err
 	}
 
 	return database.Ping(ctx)
@@ -635,19 +678,18 @@ func (d diameterStatus) Routes() []api.Route {
 
 func (h hssSender) NewSessionID() string { return h.nodes.Node().NewSessionID() }
 
-type smppSessions struct{ esmes *esme.Service }
-
-func (s smppSessions) CloseESME(id int64) { s.esmes.CloseESME(id) }
-
-func (s smppSessions) CloseUser(ctx context.Context, id int64) error {
-	return s.esmes.CloseUser(ctx, id)
-}
+type smppSessions struct{ store *db.DB }
 
 func (s smppSessions) Sessions(id int64) []api.SMPPSession {
-	var out []api.SMPPSession
+	sessions, err := s.store.SMPPSessions(context.Background(), id)
+	if err != nil {
+		return nil
+	}
 
-	for _, sess := range s.esmes.Sessions(id) {
-		out = append(out, api.SMPPSession{BindType: string(sess.BindType), Remote: sess.Remote.String(), BoundAt: sess.BoundAt})
+	out := make([]api.SMPPSession, 0, len(sessions))
+
+	for _, sess := range sessions {
+		out = append(out, api.SMPPSession{BindType: sess.BindType, Remote: sess.Remote, BoundAt: sess.BoundAt})
 	}
 
 	return out

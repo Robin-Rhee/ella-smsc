@@ -4,47 +4,54 @@ description: Step-by-step instructions to back up and restore Ella SMSC.
 
 # Back Up and Restore
 
-Ella SMSC keeps all its data, messages, users and settings, in one database file: `db.path` in the [configuration file](../reference/config_file.md). The commands below use the snap's path, `/var/snap/ella-smsc/common/smsc.db`.
-
-The backup holds message content, user accounts, and the single sign-on client secret. Store and transfer it encrypted.
+A backup holds message content, user accounts, and the single sign-on client secret. Store and transfer it encrypted.
 
 ## Back up
 
-1. Stop Ella SMSC:
+1. Create an API token for an admin: in **Users**, open the user, and in **API Tokens**, click **Create Token**.
+
+2. Download a backup:
 
     ```shell
-    sudo snap stop ella-smsc.smscd
+    curl -OJ http://<host-ip>:5010/api/v1/backup \
+      -H "Authorization: Bearer ellasmsc_..."
     ```
 
-2. Copy the database:
-
-    ```shell
-    sudo cp /var/snap/ella-smsc/common/smsc.db smsc-backup.db
-    ```
-
-3. Start Ella SMSC:
-
-    ```shell
-    sudo snap start ella-smsc.smscd
-    ```
+    This saves `smsc-backup-<time>.tar.gz`. In a cluster, back up from any node.
 
 ## Restore
 
-1. Stop Ella SMSC:
+1. Log in as an admin, and keep the token:
+
+    ```shell
+    TOKEN=$(curl -s http://<host-ip>:5010/api/v1/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"email": "admin@example.com", "password": "..."}' | jq -r .result.token)
+    ```
+
+2. Restore the backup:
+
+    ```shell
+    curl http://<host-ip>:5010/api/v1/restore \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/gzip" \
+      --data-binary @smsc-backup-<time>.tar.gz
+    ```
+
+    In a cluster, restore on any node.
+
+## Disaster recovery
+
+Use this procedure when a cluster lost a majority of its nodes, or a standalone node was lost.
+
+1. Install Ella SMSC on a new host, as in [Install](install.md). For a cluster, add a `cluster` block to the configuration file.
+2. Open `http://<host-ip>:5010` in a browser and initialize it with a temporary user.
+3. Restore the backup with that user, as in [Restore](#restore).
+4. For a standalone deployment, stop here.
+5. Log in with a user from the backup, and add the other nodes, as in [Deploy a High Availability Cluster](deploy_ha_cluster.md), steps 2 to 4. Delete the data of any node that was in the old cluster first:
 
     ```shell
     sudo snap stop ella-smsc.smscd
-    ```
-
-2. Replace the database with the backup, and remove the files that go with the old one:
-
-    ```shell
-    sudo cp smsc-backup.db /var/snap/ella-smsc/common/smsc.db
-    sudo rm -f /var/snap/ella-smsc/common/smsc.db-wal /var/snap/ella-smsc/common/smsc.db-shm
-    ```
-
-3. Start Ella SMSC:
-
-    ```shell
+    sudo rm -rf /var/snap/ella-smsc/common/smsc.db* /var/snap/ella-smsc/common/raft
     sudo snap start ella-smsc.smscd
     ```

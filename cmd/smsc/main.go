@@ -48,7 +48,7 @@ func run(cfg config.Config, logger *slog.Logger) error {
 
 	<-ctx.Done()
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.API.DrainDelay+delivery.DefaultAttemptTimeout+shutdownTimeout)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), delivery.DefaultAttemptTimeout+shutdownTimeout)
 	defer cancel()
 
 	srv.Shutdown(shutdownCtx)

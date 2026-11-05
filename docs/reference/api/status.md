@@ -6,7 +6,7 @@ description: RESTful API reference for viewing the status and health of Ella SMS
 
 ## Get the Status
 
-This path returns the version of the SMSC, and whether it is initialized.
+This path returns the version of the SMSC, whether it is initialized, and the identity of the node that answered.
 
 | Method | Path             |
 | ------ | ---------------- |
@@ -19,6 +19,10 @@ This path returns the version of the SMSC, and whether it is initialized.
 | `version`  | string | Version. |
 | `revision` | string | Git commit of the build. Empty in development builds. |
 | `initialized` | boolean | Whether the first user exists. See [Initialize](initialize.md). |
+| `clustered` | boolean | Whether the configuration file has a `cluster` block. |
+| `node_id` | string | ID of the node that answered. |
+| `display_name` | string | Display name of the node. Empty when unset. See [Update a Member](cluster.md#update-a-member). |
+| `diameter_label` | string | First label of the node's Diameter host: `smsc-` and the last 12 hex characters of `node_id`. |
 
 ### Sample Response
 
@@ -27,7 +31,11 @@ This path returns the version of the SMSC, and whether it is initialized.
     "result": {
         "version": "v0.0.1",
         "revision": "79194832364de9583e8e659ba700c2fa9ba1e351",
-        "initialized": true
+        "initialized": true,
+        "clustered": false,
+        "node_id": "01a1ac75-e354-762b-b38f-013c0a7ca824",
+        "display_name": "",
+        "diameter_label": "smsc-013c0a7ca824"
     }
 }
 ```
@@ -44,7 +52,7 @@ It answers `204 No Content`.
 
 ## Check Readiness
 
-This path returns whether the SMSC can serve requests: its database answers, and it is not shutting down.
+This path returns whether the SMSC can serve requests: its database answers, it is not shutting down, and, in a cluster, it is not draining and is in contact with the leader.
 
 | Method | Path             |
 | ------ | ---------------- |

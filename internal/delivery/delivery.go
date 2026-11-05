@@ -33,21 +33,29 @@ const (
 	outcomeKey         = attribute.Key("ella.sms.delivery.outcome")
 	outcomeRetry       = "retry"
 	outcomeInterrupted = "interrupted"
+	outcomeSuperseded  = "superseded"
 )
 
 const (
 	DefaultAttemptTimeout = 30 * time.Second
-	DefaultConcurrency    = 20
+	DefaultConcurrency    = 256
+	ClaimMargin           = 5 * time.Second
 )
 
 const mwdStatusFlags = s6c.MWDStatusMNRF | s6c.MWDStatusMCEF | s6c.MWDStatusMNRG | s6c.MWDStatusMNR5G | s6c.MWDStatusMNR5GN3G
 
 type Store interface {
-	NextDue(ctx context.Context, now time.Time, busy []string) (db.Message, bool, error)
-	NextWakeup(ctx context.Context, busy []string) (time.Time, bool, error)
+	DueRecipients(ctx context.Context, now time.Time, limit int, skip func(msisdn string) bool) ([]string, time.Time, error)
+	NextDue(ctx context.Context, msisdn string, now time.Time) (db.Message, bool, error)
 	CompleteMessage(ctx context.Context, id int64, status db.MessageStatus, at time.Time, report *db.NewStatusReport,
-		tpStatus uint8) error
-	ScheduleRetry(ctx context.Context, id int64, at, now time.Time, hold bool) error
+		tpStatus uint8, f db.Fence, attempts ...db.DeliveryAttempt) error
+	ScheduleRetry(ctx context.Context, id int64, at, now time.Time, hold bool, since time.Time, f db.Fence,
+		attempts ...db.DeliveryAttempt) error
+	ClaimRecipient(ctx context.Context, msisdn string, term uint64) (db.Claim, error)
+	ReleaseRecipient(ctx context.Context, msisdn string, c db.Claim) error
+	RecordAttemptAndClaim(ctx context.Context, a db.DeliveryAttempt, msisdn string, term uint64, alertMSISDN *string) (db.Claim,
+		error)
+	ClaimedBefore(ctx context.Context, term uint64, since time.Time) ([]string, error)
 	AlertRecipient(ctx context.Context, msisdn string, now time.Time) ([]string, error)
 	SetAlertMSISDN(ctx context.Context, msisdn, alertMSISDN string, now time.Time) error
 	NextDueFor(ctx context.Context, msisdn string, excludeID int64, now time.Time) (db.Message, bool, error)
@@ -81,9 +89,18 @@ type Deliverer struct {
 	wakeOnce sync.Once
 	wake     chan struct{}
 
-	mu      sync.Mutex
-	busy    map[string]bool
-	realert map[string]bool
+	mu       sync.Mutex
+	busy     map[string]bool
+	realert  map[string]bool
+	running  int
+	freed    chan struct{}
+	inflight sync.WaitGroup
+}
+
+type run struct {
+	term  uint64
+	held  map[string]time.Time
+	ready []string
 }
 
 type outcome int
@@ -143,10 +160,15 @@ type nodeOutcome struct {
 
 // TS 23.040 clause 9.2.3.15
 type result struct {
-	outcome outcome
-	hold    bool
-	status  tpdu.Status
+	outcome  outcome
+	hold     bool
+	status   tpdu.Status
+	attempts []db.DeliveryAttempt
 }
+
+var errInterrupted = errors.New("short message delivery interrupted")
+
+var anyClaim = time.Unix(0, 0)
 
 var (
 	statusCongestion      = tpdu.TemporaryCongestion.GaveUp()
@@ -161,6 +183,7 @@ var (
 type session struct {
 	routing s6c.Routing
 	target  target
+	next    db.Message
 }
 
 func (s *session) targets() []target {
@@ -194,65 +217,76 @@ func (d *Deliverer) Alert(ctx context.Context, msisdn string) error {
 		return err
 	}
 
+	d.Alerted(recipients)
+
+	return nil
+}
+
+func (d *Deliverer) Alerted(recipients []string) {
 	d.mu.Lock()
 
-	for _, r := range recipients {
-		if d.busy[r] {
-			d.realert[r] = true
+	for _, msisdn := range recipients {
+		if d.busy[msisdn] {
+			d.realert[msisdn] = true
 		}
 	}
 
 	d.mu.Unlock()
 
 	d.Notify()
-
-	return nil
 }
 
-func (d *Deliverer) Run(ctx context.Context) {
-	wake := d.wakeChan()
-	slots := max(d.Concurrency, 1)
-	done := make(chan string)
-	running := 0
-
+func (d *Deliverer) initState() {
 	d.mu.Lock()
-	d.busy = make(map[string]bool)
-	d.realert = make(map[string]bool)
-	d.mu.Unlock()
+	defer d.mu.Unlock()
+
+	if d.busy == nil {
+		d.busy, d.realert, d.freed = map[string]bool{}, map[string]bool{}, make(chan struct{}, 1)
+	}
+}
+
+func (d *Deliverer) Run(ctx context.Context, term uint64) {
+	d.initState()
+
+	wake := d.wakeChan()
+	r := &run{term: term, held: map[string]time.Time{}}
+
+	if !d.holdTakenOver(ctx, r) {
+		return
+	}
 
 	for ctx.Err() == nil {
 		wait := time.Duration(-1)
+		holdUntil, holding := d.refreshHolds(ctx, r)
 
-		if running < slots {
-			m, ok, err := d.Store.NextDue(ctx, d.Now(), d.busyRecipients())
-
-			switch {
-			case err != nil:
-				d.Logger.ErrorContext(ctx, "delivery worker failed", slog.Any("error", err))
-
-				wait = errorBackoff
-			case ok:
-				d.setBusy(m.MSISDN)
-
-				running++
-
-				go func() {
-					_ = d.process(ctx, m)
-
-					done <- m.MSISDN
-				}()
-
-				continue
-			default:
-				at, ok, err := d.Store.NextWakeup(ctx, d.busyRecipients())
+		if free := max(d.Concurrency, 1) - d.active(); free > 0 {
+			if len(r.ready) < free {
+				due, wakeup, err := d.Store.DueRecipients(ctx, d.Now(), free+max(d.Concurrency, 1), d.unavailable(r))
 				if err != nil {
-					d.Logger.ErrorContext(ctx, "delivery worker failed to read the next wakeup", slog.Any("error", err))
+					d.Logger.ErrorContext(ctx, "failed to read the recipients due a delivery", slog.Any("error", err))
 
 					wait = errorBackoff
-				} else if ok {
-					wait = max(at.Sub(d.Now()), 0)
+				}
+
+				if !wakeup.IsZero() {
+					wait = max(wakeup.Sub(d.Now()), 0)
+				}
+
+				r.ready = due
+			}
+
+			for free > 0 && len(r.ready) > 0 {
+				msisdn := r.ready[0]
+				r.ready = r.ready[1:]
+
+				if d.start(ctx, term, msisdn) {
+					free--
 				}
 			}
+		}
+
+		if holding && (wait < 0 || holdUntil.Sub(d.Now()) < wait) {
+			wait = max(holdUntil.Sub(d.Now()), 0)
 		}
 
 		var (
@@ -269,46 +303,176 @@ func (d *Deliverer) Run(ctx context.Context) {
 		case <-ctx.Done():
 		case <-wake:
 		case <-fire:
-		case msisdn := <-done:
-			running--
-
-			d.finish(context.WithoutCancel(ctx), msisdn)
+		case <-d.freed:
 		}
 
 		if timer != nil {
 			timer.Stop()
 		}
 	}
+}
 
-	for ; running > 0; running-- {
-		d.finish(context.WithoutCancel(ctx), <-done)
+func (d *Deliverer) Wait(ctx context.Context) error {
+	done := make(chan struct{})
+
+	go func() {
+		d.inflight.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-func (d *Deliverer) busyRecipients() []string {
+func (d *Deliverer) holdWindow() time.Duration {
+	return d.AttemptTimeout + ClaimMargin
+}
+
+// TS 23.040 clause 6.2
+func (d *Deliverer) holdTakenOver(ctx context.Context, r *run) bool {
+	if r.term == 0 {
+		return true
+	}
+
+	for {
+		now := d.Now()
+
+		claimed, err := d.Store.ClaimedBefore(ctx, r.term, anyClaim)
+		if err == nil {
+			until := now.Add(d.holdWindow())
+
+			for _, msisdn := range claimed {
+				r.held[msisdn] = until
+			}
+
+			if len(claimed) > 0 {
+				d.Logger.InfoContext(ctx, "holding the recipients the previous leader was delivering to",
+					slog.Int("recipients", len(claimed)), slog.Time("until", until))
+			}
+
+			return true
+		}
+
+		d.Logger.ErrorContext(ctx, "failed to read the recipients of the previous leader, retrying", slog.Any("error", err))
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(errorBackoff):
+		}
+	}
+}
+
+func (d *Deliverer) refreshHolds(ctx context.Context, r *run) (time.Time, bool) {
+	if len(r.held) == 0 {
+		return time.Time{}, false
+	}
+
+	now := d.Now()
+
+	claimed, err := d.Store.ClaimedBefore(ctx, r.term, anyClaim)
+
+	still := make(map[string]bool, len(claimed))
+	for _, msisdn := range claimed {
+		still[msisdn] = true
+	}
+
+	var earliest time.Time
+
+	for msisdn, until := range r.held {
+		if err == nil && !still[msisdn] || !now.Before(until) {
+			delete(r.held, msisdn)
+			continue
+		}
+
+		if earliest.IsZero() || until.Before(earliest) {
+			earliest = until
+		}
+	}
+
+	return earliest, len(r.held) > 0
+}
+
+func (d *Deliverer) active() int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	busy := make([]string, 0, len(d.busy))
-	for msisdn := range d.busy {
-		busy = append(busy, msisdn)
-	}
-
-	return busy
+	return d.running
 }
 
-func (d *Deliverer) setBusy(msisdn string) {
+func (d *Deliverer) unavailable(r *run) func(string) bool {
+	return func(msisdn string) bool {
+		if _, held := r.held[msisdn]; held {
+			return true
+		}
+
+		d.mu.Lock()
+		defer d.mu.Unlock()
+
+		return d.busy[msisdn]
+	}
+}
+
+func (d *Deliverer) start(ctx context.Context, term uint64, msisdn string) bool {
 	d.mu.Lock()
+
+	if d.busy[msisdn] {
+		d.mu.Unlock()
+		return false
+	}
+
 	d.busy[msisdn] = true
+	d.running++
 	d.mu.Unlock()
+
+	d.inflight.Go(func() {
+		defer d.finish(context.WithoutCancel(ctx), msisdn)
+
+		if err := d.drain(ctx, term, msisdn); err != nil {
+			select {
+			case <-ctx.Done():
+			case <-time.After(errorBackoff):
+			}
+		}
+	})
+
+	return true
+}
+
+func (d *Deliverer) drain(ctx context.Context, term uint64, msisdn string) error {
+	m, ok, err := d.Store.NextDue(ctx, msisdn, d.Now())
+	if err != nil {
+		if ctx.Err() == nil {
+			d.Logger.ErrorContext(ctx, "failed to read the next message to a recipient", slog.String("msisdn", msisdn),
+				slog.Any("error", err))
+		}
+
+		return err
+	}
+
+	if !ok {
+		return nil
+	}
+
+	return d.process(ctx, term, m)
 }
 
 func (d *Deliverer) finish(ctx context.Context, msisdn string) {
 	d.mu.Lock()
 	delete(d.busy, msisdn)
+	d.running--
 	realert := d.realert[msisdn]
 	delete(d.realert, msisdn)
 	d.mu.Unlock()
+
+	select {
+	case d.freed <- struct{}{}:
+	default:
+	}
 
 	if !realert {
 		return
@@ -320,13 +484,16 @@ func (d *Deliverer) finish(ctx context.Context, msisdn string) {
 }
 
 // TS 23.040 clause 6.2
-func (d *Deliverer) process(stop context.Context, m db.Message) error {
+func (d *Deliverer) process(stop context.Context, term uint64, m db.Message) error {
 	ctx := context.WithoutCancel(stop)
+	l := &lease{term: term}
+
+	defer d.releaseLease(ctx, m.MSISDN, l)
 
 	var s *session
 
 	for {
-		next, err := d.deliverAndSettle(stop, m, s)
+		next, err := d.deliverAndSettle(stop, m, s, l)
 		if err != nil {
 			return err
 		}
@@ -335,23 +502,11 @@ func (d *Deliverer) process(stop context.Context, m db.Message) error {
 			return nil
 		}
 
-		n, ok, err := d.Store.NextDueFor(ctx, m.MSISDN, m.ID, d.Now())
-		if err != nil {
-			d.Logger.ErrorContext(ctx, "failed to read the next message to the recipient of a short message",
-				slog.Int64("message_id", m.ID), slog.Any("error", err))
-
-			return err
-		}
-
-		if !ok {
-			return nil
-		}
-
-		m, s = n, next
+		m, s = next.next, next
 	}
 }
 
-func (d *Deliverer) deliverAndSettle(stop context.Context, m db.Message, s *session) (_ *session, err error) {
+func (d *Deliverer) deliverAndSettle(stop context.Context, m db.Message, s *session, l *lease) (_ *session, err error) {
 	destination := d.Identity().OriginHost
 
 	stop, span := d.tracer().Start(stop, deliverOperation+" "+destination,
@@ -368,7 +523,7 @@ func (d *Deliverer) deliverAndSettle(stop context.Context, m db.Message, s *sess
 	)
 
 	defer func() {
-		if err != nil {
+		if err != nil && !errors.Is(err, errInterrupted) {
 			d.Logger.ErrorContext(stop, "failed to record delivery outcome", slog.Int64("message_id", m.ID), slog.Any("error", err))
 			span.SetAttributes(semconv.ErrorTypeOther)
 			span.SetStatus(codes.Error, err.Error())
@@ -377,9 +532,13 @@ func (d *Deliverer) deliverAndSettle(stop context.Context, m db.Message, s *sess
 		span.End()
 	}()
 
-	r, next := d.deliver(stop, m, d.Now(), s)
+	if l != nil {
+		l.started = d.Now()
+	}
 
-	if err := d.settle(context.WithoutCancel(stop), m, r); err != nil {
+	r, next := d.deliver(stop, m, d.Now(), s, l)
+
+	if err := d.settle(context.WithoutCancel(stop), m, r, l, next != nil); err != nil {
 		return nil, err
 	}
 
@@ -405,16 +564,31 @@ func settled(ctx context.Context, outcome string) {
 	}
 }
 
-func (d *Deliverer) settle(ctx context.Context, m db.Message, r result) error {
+func (d *Deliverer) settle(ctx context.Context, m db.Message, r result, l *lease, keep bool) error {
+	f := l.fence()
+	f.Keep = keep
+
+	settledClaim := func() {
+		if l != nil && !keep {
+			l.claim = db.Claim{}
+		}
+	}
+
 	switch r.outcome {
 	case delivered:
-		return d.complete(ctx, m, db.StatusDelivered, r.status, d.Now())
+		return d.complete(ctx, m, db.StatusDelivered, r, d.Now(), f, settledClaim)
 	case expired:
-		return d.complete(ctx, m, db.StatusExpired, r.status, d.Now())
+		return d.complete(ctx, m, db.StatusExpired, r, d.Now(), f, settledClaim)
 	case permanent:
-		return d.complete(ctx, m, db.StatusFailed, r.status, d.Now())
+		return d.complete(ctx, m, db.StatusFailed, r, d.Now(), f, settledClaim)
 	case interrupted:
+		d.flush(ctx, r.attempts)
 		settled(ctx, outcomeInterrupted)
+
+		if ctx.Err() == nil {
+			return errInterrupted
+		}
+
 		return nil
 	}
 
@@ -422,28 +596,57 @@ func (d *Deliverer) settle(ctx context.Context, m db.Message, r result) error {
 
 	intervals := d.Settings().Delivery.RetryIntervals
 	if m.SingleShot || len(intervals) == 0 {
-		return d.complete(ctx, m, db.StatusFailed, r.status, now)
+		return d.complete(ctx, m, db.StatusFailed, r, now, f, settledClaim)
 	}
 
 	at := now.Add(intervals[min(m.Retries, len(intervals)-1)])
 
-	if err := d.Store.ScheduleRetry(ctx, m.ID, at, now, r.hold); err != nil {
+	var since time.Time
+	if l != nil {
+		since = l.started
+	}
+
+	err := d.Store.ScheduleRetry(ctx, m.ID, at, now, r.hold, since, f, r.attempts...)
+	if errors.Is(err, db.ErrStaleTerm) || errors.Is(err, db.ErrNotFound) {
+		d.flush(ctx, r.attempts)
+		settled(ctx, outcomeSuperseded)
+
+		return nil
+	}
+
+	if err != nil {
 		return err
 	}
 
+	settledClaim()
 	settled(ctx, outcomeRetry)
 
 	return nil
 }
 
-func (d *Deliverer) complete(ctx context.Context, m db.Message, status db.MessageStatus, reported tpdu.Status, at time.Time) error {
+func (d *Deliverer) complete(ctx context.Context, m db.Message, status db.MessageStatus, r result, at time.Time,
+	f db.Fence, settledClaim func(),
+) error {
+	reported := r.status
+
 	report, err := statusreport.For(m, reported, at, d.Settings())
 	if err != nil {
 		d.Logger.ErrorContext(ctx, "failed to make the status report on a short message", slog.Int64("message_id", m.ID),
 			slog.Any("error", err))
 	}
 
-	err = d.Store.CompleteMessage(ctx, m.ID, status, at, report, uint8(reported))
+	err = d.Store.CompleteMessage(ctx, m.ID, status, at, report, uint8(reported), f, r.attempts...)
+	if errors.Is(err, db.ErrStaleTerm) || errors.Is(err, db.ErrNotPending) || errors.Is(err, db.ErrNotFound) {
+		d.flush(ctx, r.attempts)
+	}
+
+	if errors.Is(err, db.ErrStaleTerm) {
+		d.Logger.DebugContext(ctx, "a newer leader term took the recipient over", slog.Int64("message_id", m.ID))
+		settled(ctx, outcomeSuperseded)
+
+		return nil
+	}
+
 	if errors.Is(err, db.ErrNotPending) {
 		d.Logger.DebugContext(ctx, "short message replaced during its delivery", slog.Int64("message_id", m.ID),
 			slog.String("status", string(status)))
@@ -456,6 +659,7 @@ func (d *Deliverer) complete(ctx context.Context, m db.Message, status db.Messag
 		return err
 	}
 
+	settledClaim()
 	settled(ctx, string(status))
 
 	if status == db.StatusDelivered {
@@ -465,7 +669,7 @@ func (d *Deliverer) complete(ctx context.Context, m db.Message, status db.Messag
 	return nil
 }
 
-func (d *Deliverer) deliver(stop context.Context, m db.Message, now time.Time, s *session) (result, *session) {
+func (d *Deliverer) deliver(stop context.Context, m db.Message, now time.Time, s *session, l *lease) (result, *session) {
 	ctx := context.WithoutCancel(stop)
 	log := d.Logger.With(slog.Int64("message_id", m.ID))
 
@@ -502,7 +706,13 @@ func (d *Deliverer) deliver(stop context.Context, m db.Message, now time.Time, s
 		routingAttempt := routingAttemptOf(routing, err)
 		routingAttempt.Step, routingAttempt.Node, routingAttempt.StartedAt = db.StepRouting, hss, started
 
-		d.record(ctx, log, m.ID, routingAttempt)
+		if err == nil && len(deliveryTargets(routing.ServingNodes)) > 0 {
+			if err := d.recordAndClaim(ctx, log, m, routingAttempt, l, &routing.AlertMSISDN); err != nil {
+				return d.unclaimed(ctx, log, err), nil
+			}
+		} else {
+			d.record(ctx, log, m.ID, routingAttempt)
+		}
 
 		if err != nil {
 			log.DebugContext(ctx, "routing lookup for short message failed", slog.Any("error", err))
@@ -510,7 +720,9 @@ func (d *Deliverer) deliver(stop context.Context, m db.Message, now time.Time, s
 			return d.routingFailed(ctx, m, err), nil
 		}
 
-		d.setAlertMSISDN(ctx, m.MSISDN, routing.AlertMSISDN)
+		if len(deliveryTargets(routing.ServingNodes)) == 0 {
+			d.setAlertMSISDN(ctx, m.MSISDN, routing.AlertMSISDN)
+		}
 
 		targets = deliveryTargets(routing.ServingNodes)
 	}
@@ -526,12 +738,12 @@ func (d *Deliverer) deliver(stop context.Context, m db.Message, now time.Time, s
 		return result{outcome: permanent, status: tpdu.StatusNoInterworking}, nil
 	}
 
-	_, more, err := d.Store.NextDueFor(ctx, m.MSISDN, m.ID, d.Now())
+	following, more, err := d.Store.NextDueFor(ctx, m.MSISDN, m.ID, d.Now())
 	if err != nil {
 		log.ErrorContext(ctx, "failed to look for more messages to the recipient", slog.Any("error", err))
 	}
 
-	a := d.attempt(stop, log, m, routing.IMSI, targets, deliver, more)
+	a := d.attempt(stop, log, m, routing.IMSI, targets, deliver, more, l)
 
 	if a.outcome == interrupted {
 		log.DebugContext(ctx, "short message delivery interrupted by shutdown")
@@ -545,49 +757,53 @@ func (d *Deliverer) deliver(stop context.Context, m db.Message, now time.Time, s
 			_, reported = d.report(stop, log, m, success, nil)
 		}
 
-		return result{outcome: delivered, status: tpdu.StatusReceived}, follow(routing, a.via, more && reported)
+		return result{outcome: delivered, status: tpdu.StatusReceived, attempts: a.pending}, follow(routing, a.via, following,
+			more && reported)
 	}
 
 	if a.outcome == permanent {
-		return result{outcome: permanent, status: a.status}, nil
+		return result{outcome: permanent, status: a.status, attempts: a.pending}, nil
 	}
 
 	if len(a.failures()) == 0 {
-		return result{outcome: temporary, hold: !a.rejected, status: a.status}, nil
+		return result{outcome: temporary, hold: !a.rejected, status: a.status, attempts: a.pending}, nil
 	}
 
 	if !needsReport(a.failures(), routing) {
-		return result{outcome: temporary, hold: true, status: a.status}, nil
+		return result{outcome: temporary, hold: true, status: a.status, attempts: a.pending}, nil
 	}
 
 	alert, ok := d.report(stop, log, m, a.outcomes, &routing.ServingNodes)
 	if !ok {
-		return result{outcome: temporary, hold: true, status: a.status}, nil
+		return result{outcome: temporary, hold: true, status: a.status, attempts: a.pending}, nil
 	}
 
 	retryTargets := deliveryTargets(alert.ServingNodes)
 	if len(retryTargets) == 0 || stop.Err() != nil {
-		return result{outcome: temporary, hold: true, status: a.status}, nil
+		return result{outcome: temporary, hold: true, status: a.status, attempts: a.pending}, nil
 	}
+
+	d.flush(ctx, a.pending)
 
 	log.DebugContext(ctx, "retrying delivery via the serving nodes the HSS reported")
 
-	retry := d.attempt(stop, log, m, routing.IMSI, retryTargets, deliver, more)
+	retry := d.attempt(stop, log, m, routing.IMSI, retryTargets, deliver, more, l)
 
 	switch retry.outcome {
 	case delivered:
 		_, reported := d.report(stop, log, m, retry.successReport(), nil)
 		routing.ServingNodes = alert.ServingNodes
 
-		return result{outcome: delivered, status: tpdu.StatusReceived}, follow(routing, retry.via, more && reported)
+		return result{outcome: delivered, status: tpdu.StatusReceived, attempts: retry.pending}, follow(routing, retry.via,
+			following, more && reported)
 	case permanent:
-		return result{outcome: permanent, status: retry.status}, nil
+		return result{outcome: permanent, status: retry.status, attempts: retry.pending}, nil
 	default:
-		return result{outcome: temporary, hold: true, status: retry.status}, nil
+		return result{outcome: temporary, hold: true, status: retry.status, attempts: retry.pending}, nil
 	}
 }
 
-func follow(routing s6c.Routing, via target, announced bool) *session {
+func follow(routing s6c.Routing, via target, next db.Message, announced bool) *session {
 	if !announced {
 		return nil
 	}
@@ -595,7 +811,7 @@ func follow(routing s6c.Routing, via target, announced bool) *session {
 	routing.MWDStatus &^= mwdStatusFlags
 	routing.Absent = s6c.AbsentUserDiagnostics{}
 
-	return &session{routing: routing, target: via}
+	return &session{routing: routing, target: via, next: next}
 }
 
 // TS 23.040 clause 3.3 table 1
@@ -662,6 +878,7 @@ func (d *Deliverer) setAlertMSISDN(ctx context.Context, msisdn, alertMSISDN stri
 }
 
 type attemptResult struct {
+	pending   []db.DeliveryAttempt
 	outcome   outcome
 	outcomes  []nodeOutcome
 	via       target
@@ -695,7 +912,7 @@ func (a attemptResult) successReport() []nodeOutcome {
 }
 
 func (d *Deliverer) attempt(stop context.Context, log *slog.Logger, m db.Message, imsi string, targets []target,
-	deliver func(bool) ([]byte, error), more bool,
+	deliver func(bool) ([]byte, error), more bool, l *lease,
 ) attemptResult {
 	var a attemptResult
 
@@ -714,6 +931,13 @@ func (d *Deliverer) attempt(stop context.Context, log *slog.Logger, m db.Message
 			break
 		}
 
+		if err := d.ensureClaim(ctx, m, l); err != nil {
+			unclaimed := d.unclaimed(ctx, log, err)
+			a.outcome, a.status, a.hasStatus = unclaimed.outcome, unclaimed.status, true
+
+			return a
+		}
+
 		started := d.Now()
 		r, err := d.forward(ctx, imsi, t, deliver, more)
 
@@ -724,7 +948,16 @@ func (d *Deliverer) attempt(stop context.Context, log *slog.Logger, m db.Message
 
 		deliveryAttempt.Step, deliveryAttempt.Node, deliveryAttempt.StartedAt = db.StepDelivery, t.name, started
 
-		d.record(ctx, log, m.ID, deliveryAttempt)
+		if continues := r.outcome != delivered && r.outcome != permanent && i+1 < len(targets) && stop.Err() == nil; continues {
+			if err := d.recordAndClaim(ctx, log, m, deliveryAttempt, l, nil); err != nil {
+				unclaimed := d.unclaimed(ctx, log, err)
+				a.outcome, a.status, a.hasStatus = unclaimed.outcome, unclaimed.status, true
+
+				return a
+			}
+		} else {
+			a.pending = append(a.pending, d.pending(ctx, log, m.ID, deliveryAttempt))
+		}
 
 		if r.cause != nil {
 			a.outcomes = append(a.outcomes, nodeOutcome{kind: t.kind, source: t.source, cause: *r.cause, diagnostic: r.diagnostic})
@@ -1068,15 +1301,17 @@ func classifyForwardAnswer(err error) forwardResult {
 	}
 }
 
+// TS 23.040 clause 3.3.2
 // TS 23.040 clause 9.2.3.22
+// TS 23.040 clause 11.1
 func rejectsMessage(diagnostic []byte) bool {
 	fcs, ok := tpdu.DeliverReportFailureCause(diagnostic)
 	if !ok {
-		return true
+		return false
 	}
 
 	switch fcs {
-	case tpdu.FailureUSIMStorageFull, tpdu.FailureMemoryCapacityExceeded, tpdu.FailureUSIMToolkitBusy:
+	case tpdu.FailureUSIMStorageFull, tpdu.FailureErrorInMS, tpdu.FailureMemoryCapacityExceeded, tpdu.FailureUSIMToolkitBusy:
 		return false
 	default:
 		return true

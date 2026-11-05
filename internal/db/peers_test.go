@@ -128,10 +128,12 @@ func TestPeerHostIsUnique(t *testing.T) {
 		t.Fatalf("UpdatePeer to the host of another = %v", err)
 	}
 
-	for range 2 {
-		if _, err := d.CreatePeer(ctx, settings.Peer{Addresses: other.Addresses, Port: 3868}); err != nil {
-			t.Fatalf("CreatePeer without a host: %v", err)
-		}
+	if _, err := d.CreatePeer(ctx, settings.Peer{Addresses: other.Addresses, Port: 3868}); err != nil {
+		t.Fatalf("CreatePeer without a host: %v", err)
+	}
+
+	if _, err := d.CreatePeer(ctx, settings.Peer{Addresses: other.Addresses, Port: 3868}); !errors.Is(err, settings.ErrConflict) {
+		t.Fatalf("second CreatePeer without a host at the same address = %v, want a conflict", err)
 	}
 }
 
@@ -158,7 +160,7 @@ func TestDeletePeer(t *testing.T) {
 
 	for _, table := range []string{"diameter_peer_addresses", "diameter_routes"} {
 		var n int
-		if err := d.conn.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil || n != 0 {
+		if err := d.writer.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil || n != 0 {
 			t.Fatalf("%s has %d rows, %v", table, n, err)
 		}
 	}
@@ -176,7 +178,7 @@ func TestDefaultRouteIsStoredWithoutARealm(t *testing.T) {
 	}
 
 	var realm string
-	if err := d.conn.QueryRowContext(ctx, "SELECT realm FROM diameter_routes").Scan(&realm); err != nil || realm != "" {
+	if err := d.writer.QueryRowContext(ctx, "SELECT realm FROM diameter_routes").Scan(&realm); err != nil || realm != "" {
 		t.Fatalf("realm = %q, %v", realm, err)
 	}
 
@@ -190,5 +192,39 @@ func TestDefaultRouteIsStoredWithoutARealm(t *testing.T) {
 
 	if _, err := d.CreatePeer(ctx, p); err == nil {
 		t.Fatal("expected a constraint error for a default s6c route")
+	}
+}
+
+func TestMemberAndPeerHostsDoNotCollide(t *testing.T) {
+	ctx := context.Background()
+	d := openTestDB(t)
+
+	s, err := d.GetSettings(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const taken, free = "01a1ac75-e354-762b-b38f-013c0a7ca824", "01a1ac75-e354-762b-b38f-0123456789ab"
+
+	p := testPeer()
+	p.Host = s.Operator.Host(settings.NodeLabel(taken))
+
+	if _, err := d.CreatePeer(ctx, p); err != nil {
+		t.Fatalf("CreatePeer: %v", err)
+	}
+
+	if err := d.RegisterMember(ctx, Member{NodeID: taken, Address: "192.0.2.1:7000", Version: "v"}); !errors.Is(err, settings.ErrConflict) {
+		t.Fatalf("RegisterMember with a peer's host = %v", err)
+	}
+
+	if err := d.RegisterMember(ctx, Member{NodeID: free, Address: "192.0.2.2:7000", Version: "v"}); err != nil {
+		t.Fatalf("RegisterMember: %v", err)
+	}
+
+	q := testPeer()
+	q.Host = s.Operator.Host(settings.NodeLabel(free))
+
+	if _, err := d.CreatePeer(ctx, q); !errors.Is(err, settings.ErrConflict) {
+		t.Fatalf("CreatePeer with a member's host = %v", err)
 	}
 }

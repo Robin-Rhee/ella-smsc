@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ type Settings struct {
 	Delivery  Delivery
 	Retention Retention
 	Peers     []Peer
+	Labels    []string
 }
 
 type Operator struct {
@@ -28,8 +30,23 @@ type Operator struct {
 }
 
 // TS 23.003 clause 19.4.2.8
-func (o Operator) Host() string {
-	return "smsc.node." + o.Realm()
+func (o Operator) Host(label string) string {
+	return label + ".node." + o.Realm()
+}
+
+func NodeLabel(nodeID string) string {
+	id := strings.ToLower(nodeID)
+
+	return "smsc-" + id[max(len(id)-12, 0):]
+}
+
+func (s Settings) Hosts() []string {
+	hosts := make([]string, len(s.Labels))
+	for i, l := range s.Labels {
+		hosts[i] = s.Operator.Host(l)
+	}
+
+	return hosts
 }
 
 // TS 23.003 clause 19.2
@@ -57,7 +74,7 @@ func (s Settings) Validate() error {
 	errs := []error{s.Operator.Validate(), s.Delivery.Validate(), s.Retention.Validate()}
 
 	for i, p := range s.Peers {
-		errs = append(errs, p.Validate(), p.conflict(s.Peers[:i], s.Operator.Host()))
+		errs = append(errs, p.Validate(), p.Conflict(s.Peers[:i], s.Hosts()))
 	}
 
 	return errors.Join(errs...)
@@ -118,6 +135,7 @@ type Live struct {
 	current atomic.Pointer[Settings]
 
 	mu      sync.Mutex
+	stateMu sync.Mutex
 	changed chan struct{}
 }
 
@@ -136,6 +154,20 @@ func NewLive(store Store, initial Settings) *Live {
 	return l
 }
 
+func (o Operator) Conflict(peers []Peer, labels []string) error {
+	s := Settings{Operator: o, Labels: labels}
+
+	for _, host := range s.Hosts() {
+		for _, p := range peers {
+			if strings.EqualFold(p.Host, host) {
+				return fmt.Errorf("%w: host %s is peer %d's", ErrConflict, host, p.ID)
+			}
+		}
+	}
+
+	return nil
+}
+
 func (l *Live) Get() Settings {
 	return *l.current.Load()
 }
@@ -146,10 +178,8 @@ func (l *Live) UpdateOperator(ctx context.Context, o Operator) error {
 	}
 
 	return l.change(func(s *Settings) error {
-		for _, p := range s.Peers {
-			if strings.EqualFold(p.Host, o.Host()) {
-				return fmt.Errorf("%w: host %s is peer %d's", ErrConflict, o.Host(), p.ID)
-			}
+		if err := o.Conflict(s.Peers, s.Labels); err != nil {
+			return err
 		}
 
 		if err := l.store.UpdateOperator(ctx, o); err != nil {
@@ -201,17 +231,67 @@ func (l *Live) change(fn func(*Settings) error) error {
 		return err
 	}
 
-	l.current.Store(&next)
-
-	close(l.changed)
-	l.changed = make(chan struct{})
+	l.swap(next)
 
 	return nil
 }
 
+func (l *Live) Reload(next Settings) {
+	next.Delivery.RetryIntervals = slices.Clone(next.Delivery.RetryIntervals)
+	next.Peers = slices.Clone(next.Peers)
+
+	for i, p := range next.Peers {
+		next.Peers[i] = clonePeer(p)
+	}
+
+	l.swap(next)
+}
+
+func (l *Live) swap(next Settings) {
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
+
+	if reflect.DeepEqual(normalized(*l.current.Load()), normalized(next)) {
+		return
+	}
+
+	l.current.Store(&next)
+
+	close(l.changed)
+	l.changed = make(chan struct{})
+}
+
+func normalized(s Settings) Settings {
+	if len(s.Delivery.RetryIntervals) == 0 {
+		s.Delivery.RetryIntervals = nil
+	}
+
+	peers := make([]Peer, len(s.Peers))
+
+	for i, p := range s.Peers {
+		if len(p.Addresses) == 0 {
+			p.Addresses = nil
+		}
+
+		if len(p.Routes) == 0 {
+			p.Routes = nil
+		}
+
+		peers[i] = p
+	}
+
+	if len(peers) == 0 {
+		peers = nil
+	}
+
+	s.Peers = peers
+
+	return s
+}
+
 func (l *Live) Changed() <-chan struct{} {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.stateMu.Lock()
+	defer l.stateMu.Unlock()
 
 	return l.changed
 }

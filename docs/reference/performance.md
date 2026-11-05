@@ -4,23 +4,31 @@ description: Reference of the measured capacity and performance of Ella SMSC.
 
 # Performance
 
-Measured short message capacity of Ella SMSC, with 100,000 subscribers on a 4 vCPU host.
+Measured short message capacity of Ella SMSC, with 100,000 subscribers, on 1 node and on a 3-node [cluster](../explanation/high_availability.md), each node on 4 CPU cores.
+
+Ella SMSC sustains 2,000 short messages per second from phones, on 1 node or a 3-node cluster, with every message delivered and a delivery p99 under 120 ms.
 
 ## Short Messages from Phones
 
 Submission time: from the MO-Forward-Short-Message request to its answer, the message accepted and stored. Delivery time: from the MO-Forward-Short-Message request to the MT-Forward-Short-Message request of its delivery to the recipient's MME (TS 29.338 §6.2).
 
-| Rate (/s) | Messages per hour | Submission success rate | Submission time, p99 | Delivery success rate | Delivery time, mean | Delivery time, p99 | CPU (cores) | Resident memory |
-| --------- | ----------------- | ----------------------- | -------------------- | --------------------- | ------------------- | ------------------ | ----------- | --------------- |
-| 100 | 360,000 | 100% | 27 ms | 100% | 3 ms | 33 ms | 0.09 | 36 MiB |
-| 400 | 1,440,000 | 100% | 32 ms | 100% | 6 ms | 35 ms | 0.28 | 55 MiB |
-| 800 | 2,880,000 | 100% | 22 ms | 100% | 6 ms | 26 ms | 0.54 | 87 MiB |
-| 1,000 | 3,600,000 | 100% | 19 ms | 100% | 7 ms | 22 ms | 0.63 | 130 MiB |
-| 1,200 | 4,320,000 | 100% | 22 ms | 100% | 9 ms | 31 ms | 0.68 | 174 MiB |
-| 1,600 | 5,760,000 | 100% | 25 ms | 100% | 4.0 s | 7.6 s | 0.73 | 228 MiB |
-| 2,000 | 7,200,000 | 100% | 113 ms | 100% | 18.3 s | 26.8 s | 0.57 | 231 MiB |
+### 1 Node
 
-Maximum rate with a delivery time p99 under 100 ms: 1,200 messages per second.
+| Rate (/s) | Messages per hour | Submission success rate | Submission time, p99 | Delivery success rate | Delivery time, mean | Delivery time, p99 | CPU (cores) |
+| --------- | ----------------- | ----------------------- | -------------------- | --------------------- | ------------------- | ------------------ | ----------- |
+| 500 | 1,800,000 | 100% | 33 ms | 100% | 34 ms | 59 ms | 0.26 |
+| 1,000 | 3,600,000 | 100% | 34 ms | 100% | 32 ms | 59 ms | 0.40 |
+| 1,500 | 5,400,000 | 100% | 39 ms | 100% | 36 ms | 68 ms | 0.53 |
+| 2,000 | 7,200,000 | 100% | 49 ms | 100% | 41 ms | 81 ms | 0.68 |
+
+### 3 Nodes
+
+| Rate (/s) | Messages per hour | Submission success rate | Submission time, p99 | Delivery success rate | Delivery time, mean | Delivery time, p99 | CPU of the leader (cores) |
+| --------- | ----------------- | ----------------------- | -------------------- | --------------------- | ------------------- | ------------------ | ------------------------- |
+| 500 | 1,800,000 | 100% | 90 ms | 100% | 75 ms | 135 ms | 0.24 |
+| 1,000 | 3,600,000 | 100% | 67 ms | 100% | 65 ms | 96 ms | 0.40 |
+| 1,500 | 5,400,000 | 100% | 75 ms | 100% | 68 ms | 108 ms | 0.56 |
+| 2,000 | 7,200,000 | 100% | 79 ms | 100% | 71 ms | 113 ms | 0.72 |
 
 ## Short Messages from ESMEs
 
@@ -28,65 +36,41 @@ Submission time: from the `submit_sm` to its `submit_sm_resp`, the message accep
 
 ### Without Delivery Receipts
 
-| Rate (/s) | Messages per hour | Submission success rate | Submission time, p99 | Delivery success rate | Delivery time, mean | Delivery time, p99 | CPU (cores) | Resident memory |
-| --------- | ----------------- | ----------------------- | -------------------- | --------------------- | ------------------- | ------------------ | ----------- | --------------- |
-| 100 | 360,000 | 100% | 27 ms | 100% | 3 ms | 34 ms | 0.09 | 34 MiB |
-| 400 | 1,440,000 | 100% | 29 ms | 100% | 4 ms | 32 ms | 0.30 | 35 MiB |
-| 800 | 2,880,000 | 100% | 19 ms | 100% | 6 ms | 22 ms | 0.52 | 35 MiB |
-| 1,000 | 3,600,000 | 100% | 20 ms | 100% | 8 ms | 23 ms | 0.62 | 36 MiB |
-| 1,200 | 4,320,000 | 100% | 41 ms | 100% | 4.4 s | 10.4 s | 0.55 | 36 MiB |
-| 1,600 | 5,760,000 | 100% | 66 ms | 100% | 22.5 s | 26.7 s | 0.40 | 36 MiB |
-| 2,000 | 7,200,000 | 100% | 2.9 s | 100% | 33.4 s | 38.7 s | 0.36 | 37 MiB |
-
-Maximum rate with a delivery time p99 under 100 ms: 1,000 messages per second.
+| Nodes | Rate (/s) | Rate reached (/s) | Submission time, p99 | Delivery time, mean | Delivery time, p99 | CPU (cores) | Resident memory |
+| ----- | --------- | ----------------- | -------------------- | ------------------- | ------------------ | ----------- | --------------- |
+| 1 | 1,000 | 1,000 | 33 ms | 33 ms | 58 ms | 0.39 | 71 MiB |
+| 1 | 2,000 | 1,998 | 283 ms | 86 ms | 304 ms | 0.62 | 71 MiB |
+| 3 | 1,000 | 999 | 75 ms | 67 ms | 115 ms | 0.39 | 83 MiB |
+| 3 | 2,000 | 1,170 | 14.0 s | 6.90 s | 14.0 s | 0.41 | 135 MiB |
 
 ### With Delivery Receipts
 
 Receipt time: from the `submit_sm` to the `deliver_sm` of its delivery receipt.
 
-| Rate (/s) | Messages per hour | Submission success rate | Submission time, p99 | Delivery success rate | Delivery time, mean | Delivery time, p99 | Receipt success rate | Receipt time, mean | Receipt time, p99 | CPU (cores) | Resident memory |
-| --------- | ----------------- | ----------------------- | -------------------- | --------------------- | ------------------- | ------------------ | -------------------- | ------------------ | ----------------- | ----------- | --------------- |
-| 100 | 360,000 | 100% | 27 ms | 100% | 3 ms | 34 ms | 100% | 4 ms | 36 ms | 0.15 | 34 MiB |
-| 200 | 720,000 | 100% | 28 ms | 100% | 3 ms | 31 ms | 100% | 4 ms | 34 ms | 0.30 | 35 MiB |
-| 300 | 1,080,000 | 100% | 16 ms | 100% | 3 ms | 19 ms | 100% | 4 ms | 21 ms | 0.51 | 35 MiB |
-| 400 | 1,440,000 | 100% | 17 ms | 100% | 4 ms | 20 ms | 100% | 6 ms | 23 ms | 0.77 | 36 MiB |
-| 600 | 2,160,000 | 100% | 20 ms | 100% | 13 ms | 40 ms | 100% | 19 ms | 49 ms | 0.89 | 36 MiB |
-| 800 | 2,880,000 | 100% | 37 ms | 100% | 7.9 s | 15.2 s | 100% | 7.9 s | 15.2 s | 0.82 | 37 MiB |
-| 1,000 | 3,600,000 | 100% | 44 ms | 100% | 24.9 s | 39.9 s | 100% | 24.9 s | 39.9 s | 0.56 | 38 MiB |
+| Nodes | Rate (/s) | Submission time, p99 | Delivery time, mean | Delivery time, p99 | Receipt time, mean | Receipt time, p99 | CPU (cores) | Resident memory |
+| ----- | --------- | -------------------- | ------------------- | ------------------ | ------------------ | ----------------- | ----------- | --------------- |
+| 1 | 600 | 34 ms | 34 ms | 61 ms | 58 ms | 97 ms | 0.35 | 57 MiB |
+| 1 | 1,200 | 42 ms | 37 ms | 74 ms | 2.10 s | 4.33 s | 0.54 | 90 MiB |
+| 3 | 600 | 64 ms | 67 ms | 121 ms | 1.53 s | 2.96 s | 0.31 | 82 MiB |
+| 3 | 1,200 | 113 ms | 81 ms | 148 ms | 10.2 s | 18.2 s | 0.52 | 99 MiB |
 
-Maximum rate with a delivery time and a receipt time p99 under 100 ms: 600 messages per second.
+Every message was submitted, delivered and receipted.
 
-## Sustained Load
-
-Short messages from phones at 400 per second for 10 minutes: 240,000 messages, from and to subscribers at random, so most of the 100,000 send and receive.
-
-| Rate (/s) | Messages | Submission success rate | Submission time, p99 | Delivery success rate | Delivery time, mean | Delivery time, p99 | CPU (cores) | Resident memory |
-| --------- | -------- | ----------------------- | -------------------- | --------------------- | ------------------- | ------------------ | ----------- | --------------- |
-| 400 | 240,000 | 100% | 18 ms | 100% | 3 ms | 20 ms | 0.31 | 177 MiB |
-
-## Storage
-
-| Item | Value |
-| ---- | ----- |
-| Resident memory, idle | 24 MiB |
-| Database size per message from a phone | About 590 bytes |
-| Database size per message from an ESME | About 600 bytes |
-| Database size per message from an ESME, with a delivery receipt | About 720 bytes |
-| Messages kept | 30 days after their final status, by default. See [Retention](api/retention.md). |
+In a cluster, CPU and memory are those of the node the ESME is bound to.
 
 ## Test Setup
 
 | Item | Value |
 | ---- | ----- |
 | Version | Ella SMSC built from source, after v0.0.1, default configuration, with the SMPP listener |
-| Host | VM, 4 vCPU, 8 GB RAM, Ubuntu 26.04, Linux 7.0, on an Intel Core Ultra 7 265K |
-| Open-file limit | 524,288 (systemd default) |
-| Load generator | Separate VM, 10 vCPU, 10 GB RAM |
-| Core network | Simulated MME and HSS, over SGd and S6c, over SCTP: answers at once |
+| Host | 1 host: Intel Core Ultra 7 265K, 20 cores, NVMe SSD with ext4, Ubuntu 26.04, Linux 7.0 |
+| Nodes | Each pinned to its own 4 cores, on its own loopback address. The nodes of a cluster share the SSD. |
+| Load generator | On the same host, pinned to 8 other cores |
+| Core network | Simulated MME and HSS, over SGd and S6c, over SCTP, connected to every node: answers at once |
 | Subscribers | 100,000, all reachable |
-| Short messages from phones | SMS-SUBMIT of 8-bit text, 25 to 30 octets, without status report requests, each from a subscriber to another at random |
-| ESME | 1, with 4 transceiver sessions, at most 10 `submit_sm` without a response per session |
+| Short messages from phones | SMS-SUBMIT of 8-bit text, 25 to 30 octets, without status report requests, each from a subscriber to another at random, spread over every node |
+| ESME | 1, with 4 transceiver sessions to one node, at most 10 `submit_sm` without a response per session |
 | Short messages from ESMEs | `submit_sm` of 8-bit data, `data_coding` `0x04`, 12 to 17 octets, each to a subscriber at random. With delivery receipts: `registered_delivery` `0x01` |
-| Rates | Each held 30 s, except the sustained load, in increasing order, on a new database for each table |
-| Runs | 2 of each rate table, 1 of the sustained load. Each row is the run with the higher delivery time p99 |
-| Success | Delivered, or receipted, within 60 s of the end of the rate |
+| Rates | Each held 20 s, in increasing order, on a new database for each table |
+| Runs | 1 of each table |
+| Success | Delivered, or receipted, within 20 s of the end of the rate |

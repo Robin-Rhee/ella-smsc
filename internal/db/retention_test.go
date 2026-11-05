@@ -44,7 +44,7 @@ func TestPurgeMessages(t *testing.T) {
 			name: "replaced before the cutoff",
 			setup: func(t *testing.T, d *DB) (int64, int64) {
 				id := create(t, d, submitted)
-				if _, err := d.conn.ExecContext(context.Background(), `UPDATE messages SET status = ?, updated_at = ? WHERE id = ?`,
+				if _, err := d.writer.ExecContext(context.Background(), `UPDATE messages SET status = ?, updated_at = ? WHERE id = ?`,
 					StatusReplaced, before.UnixNano(), id); err != nil {
 					t.Fatal(err)
 				}
@@ -126,7 +126,7 @@ func TestPurgeMessagesInBatches(t *testing.T) {
 	d := openTestDB(t)
 	at := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
 
-	tx, err := d.conn.BeginTx(ctx, nil)
+	tx, err := d.writer.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestPurgeMessagesInBatches(t *testing.T) {
 func TestPurgeMessagesUsesItsIndex(t *testing.T) {
 	d := openTestDB(t)
 
-	rows, err := d.conn.QueryContext(context.Background(), `EXPLAIN QUERY PLAN `+purgeableMessages, 0, 1000)
+	rows, err := d.writer.QueryContext(context.Background(), `EXPLAIN QUERY PLAN `+purgeableMessages, 0, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +257,7 @@ func create(t *testing.T, d *DB, at time.Time) int64 {
 func completed(status MessageStatus, at time.Time) func(t *testing.T, d *DB) (int64, int64) {
 	return func(t *testing.T, d *DB) (int64, int64) {
 		id := create(t, d, at.Add(-time.Hour))
-		if err := d.CompleteMessage(context.Background(), id, status, at, nil, 0); err != nil {
+		if err := d.CompleteMessage(context.Background(), id, status, at, nil, 0, Fence{}); err != nil {
 			t.Fatalf("CompleteMessage: %v", err)
 		}
 
@@ -270,7 +270,7 @@ func reported(delivered, reportDone time.Time) func(t *testing.T, d *DB) (int64,
 		ctx := context.Background()
 		id := create(t, d, delivered.Add(-time.Hour))
 
-		if err := d.CompleteMessage(ctx, id, StatusDelivered, delivered, testReport(delivered), 0); err != nil {
+		if err := d.CompleteMessage(ctx, id, StatusDelivered, delivered, testReport(delivered), 0, Fence{}); err != nil {
 			t.Fatalf("CompleteMessage: %v", err)
 		}
 
@@ -280,7 +280,7 @@ func reported(delivered, reportDone time.Time) func(t *testing.T, d *DB) (int64,
 		}
 
 		if !reportDone.IsZero() {
-			if err := d.CompleteMessage(ctx, reports[0].ID, StatusDelivered, reportDone, nil, 0); err != nil {
+			if err := d.CompleteMessage(ctx, reports[0].ID, StatusDelivered, reportDone, nil, 0, Fence{}); err != nil {
 				t.Fatalf("CompleteMessage of the report: %v", err)
 			}
 		}
@@ -303,7 +303,7 @@ func count(t *testing.T, d *DB, table string) int {
 	t.Helper()
 
 	var n int
-	if err := d.conn.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM `+table).Scan(&n); err != nil {
+	if err := d.writer.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM `+table).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 

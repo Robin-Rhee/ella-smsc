@@ -39,7 +39,6 @@ import (
 
 const (
 	coreHost             = "core.example.org"
-	smscHost             = "smsc.node.epc.mnc001.mcc001.3gppnetwork.org"
 	realm                = "epc.mnc001.mcc001.3gppnetwork.org"
 	serviceCentreAddress = "15550000000"
 	mmeNumber            = "15550000010"
@@ -632,6 +631,10 @@ type smsc struct {
 	token  string
 	client *http.Client
 	url    string
+}
+
+func (s *smsc) host() string {
+	return s.server.DiameterLabel() + ".node." + realm
 }
 
 type smscConfig struct {
@@ -1488,7 +1491,7 @@ func TestAPIDiameterStatus(t *testing.T) {
 	s.api(t, http.MethodGet, "/api/v1/diameter", nil, &status)
 
 	if len(status.Routes) != 1 || status.Routes[0].Realm != realm || status.Routes[0].Application != "s6c" ||
-		len(status.Routes[0].Peers) != 0 || len(status.Peers) != 0 || status.Host != smscHost {
+		len(status.Routes[0].Peers) != 0 || len(status.Peers) != 0 || status.Host != s.host() {
 		t.Fatalf("before connect = %+v", status)
 	}
 
@@ -1609,112 +1612,4 @@ func TestHeldMessagesFollowInOneSession(t *testing.T) {
 
 		stamps = append(stamps, stamp)
 	}
-}
-
-func TestShutdownDrainsTheAPI(t *testing.T) {
-	cfg := testConfig(t, filepath.Join(t.TempDir(), "smsc.db"))
-	cfg.API.DrainDelay = time.Second
-	s := startSMSC(t, cfg)
-
-	get := func(path string) int {
-		t.Helper()
-
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, s.url+path, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		resp, err := s.client.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		_ = resp.Body.Close()
-
-		return resp.StatusCode
-	}
-
-	if code := get("/api/v1/readyz"); code != http.StatusNoContent {
-		t.Fatalf("readyz before shutdown = %d", code)
-	}
-
-	srv := s.server
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		srv.Shutdown(context.Background())
-	}()
-
-	deadline := time.Now().Add(waitTimeout)
-	for get("/api/v1/readyz") != http.StatusServiceUnavailable {
-		if time.Now().After(deadline) {
-			t.Fatal("readyz never failed while draining")
-		}
-
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	if code := get("/api/v1/livez"); code != http.StatusNoContent {
-		t.Fatalf("livez while draining = %d", code)
-	}
-
-	<-done
-
-	s.server = nil
-	_ = s.store.Close()
-}
-
-func TestShutdownStartsNoDelivery(t *testing.T) {
-	core := newFakeCore(t, alice, bob)
-	cfg := testConfig(t, filepath.Join(t.TempDir(), "smsc.db"))
-	cfg.API.DrainDelay = time.Second
-	s := startSMSC(t, cfg)
-
-	core.connect(s)
-
-	srv := s.server
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		srv.Shutdown(context.Background())
-	}()
-
-	eventually(t, "the drain", func() bool {
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, s.url+"/api/v1/readyz", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		resp, err := s.client.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		_ = resp.Body.Close()
-
-		return resp.StatusCode == http.StatusServiceUnavailable
-	})
-
-	if rc := core.submit(alice, bob, "during the drain"); rc != diameter.ResultSuccess {
-		t.Fatalf("OFA result = %d", rc)
-	}
-
-	<-done
-
-	s.server = nil
-
-	if routings := core.routingRequests(); len(routings) != 0 {
-		t.Fatalf("routing requests during shutdown = %v", routings)
-	}
-
-	m, err := s.store.GetMessage(t.Context(), 1)
-	if err != nil || m.Status != db.StatusPending {
-		t.Fatalf("message = %s, %v; want pending", m.Status, err)
-	}
-
-	_ = s.store.Close()
 }

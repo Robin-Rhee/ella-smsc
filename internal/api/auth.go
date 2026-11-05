@@ -39,6 +39,7 @@ const (
 	MinPasswordLength       = 8
 	MaxPasswordLength       = 72
 	touchInterval           = time.Minute
+	catchUpTimeout          = 2 * time.Second
 )
 
 type AuthStore interface {
@@ -66,6 +67,9 @@ type AuthStore interface {
 	CountAPITokens(ctx context.Context, userID int64) (int, error)
 	DeleteAPIToken(ctx context.Context, userID int64, tokenID string) error
 	TouchAPIToken(ctx context.Context, id int64, at time.Time) error
+
+	AppliedIndex() uint64
+	WaitApplied(ctx context.Context, index uint64) error
 }
 
 type Permission string
@@ -91,21 +95,26 @@ const (
 	PermUpdateESME         Permission = "esme:update"
 	PermReadOIDC           Permission = "oidc:read"
 	PermUpdateOIDC         Permission = "oidc:update"
+	PermBackup             Permission = "backup:manage"
+	PermReadCluster        Permission = "cluster:read"
+	PermManageCluster      Permission = "cluster:manage"
 )
 
 var permissions = map[db.Role][]Permission{
 	db.RoleAdmin: {
 		PermCreateMessage, PermReadMessage, PermReadMessageContent, PermReadDiameter, PermReadOperator, PermUpdateOperator,
 		PermReadDelivery, PermUpdateDelivery, PermReadRetention, PermUpdateRetention, PermSelf, PermManageUsers,
-		PermReadProfiles, PermUpdateDiameter, PermReadESME, PermUpdateESME, PermReadOIDC, PermUpdateOIDC,
+		PermReadProfiles, PermUpdateDiameter, PermReadESME, PermUpdateESME, PermReadOIDC, PermUpdateOIDC, PermBackup,
+		PermReadCluster, PermManageCluster,
 	},
 	db.RoleReadOnly: {
 		PermReadMessage, PermReadDiameter, PermReadOperator, PermReadDelivery, PermReadRetention, PermSelf, PermReadESME,
+		PermReadCluster,
 	},
 	db.RoleNetworkManager: {
 		PermCreateMessage, PermReadMessage, PermReadMessageContent, PermReadDiameter, PermReadOperator, PermUpdateOperator,
 		PermReadDelivery, PermUpdateDelivery, PermReadRetention, PermUpdateRetention, PermSelf, PermUpdateDiameter,
-		PermReadESME,
+		PermReadESME, PermReadCluster,
 	},
 	db.RoleSubmitter: {PermCreateMessage, PermReadMessage, PermReadMessageContent, PermSelf},
 }
@@ -319,6 +328,7 @@ type claims struct {
 	Email     string  `json:"email"`
 	RoleID    db.Role `json:"role_id"`
 	SessionID int64   `json:"sid"`
+	Index     uint64  `json:"idx,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -330,23 +340,33 @@ func (a *auth) accessToken(u db.User, sessionID int64) (string, error) {
 		Email:     u.Email,
 		RoleID:    u.Role,
 		SessionID: sessionID,
+		Index:     a.cfg.Auth.AppliedIndex(),
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(AccessTokenDuration)),
 		},
-	}).SignedString(a.cfg.JWTSecret)
+	}).SignedString(a.cfg.JWTSecret())
 }
 
 func (a *auth) checkAccessToken(ctx context.Context, token string) (int64, error) {
 	var c claims
 
-	if _, err := jwt.ParseWithClaims(token, &c, func(*jwt.Token) (any, error) { return a.cfg.JWTSecret, nil },
+	if _, err := jwt.ParseWithClaims(token, &c, func(*jwt.Token) (any, error) { return a.cfg.JWTSecret(), nil },
 		jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired(),
 		jwt.WithIssuedAt(), jwt.WithTimeFunc(a.cfg.Now)); err != nil {
 		return 0, err
 	}
 
 	s, err := a.cfg.Auth.GetSession(ctx, c.SessionID)
+	if errors.Is(err, db.ErrNotFound) && c.Index > a.cfg.Auth.AppliedIndex() {
+		wait, cancel := context.WithTimeout(ctx, catchUpTimeout)
+		defer cancel()
+
+		if a.cfg.Auth.WaitApplied(wait, c.Index) == nil {
+			s, err = a.cfg.Auth.GetSession(ctx, c.SessionID)
+		}
+	}
+
 	if err != nil {
 		return 0, storeError("get session", err)
 	}

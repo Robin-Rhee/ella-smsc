@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/mattn/go-sqlite3"
 )
@@ -25,11 +28,24 @@ func isUnique(err error) bool {
 }
 
 type DB struct {
-	conn    *sql.DB
-	path    string
-	metrics metrics
-	queued  func()
+	writer      *sql.DB
+	readers     atomic.Pointer[sql.DB]
+	checkpoints *checkpointer
+	path        string
+	metrics     metrics
+	proposer    Proposer
+	applyMu     sync.Mutex
+	applied     atomic.Uint64
+	appliedMu   sync.Mutex
+	appliedCh   chan struct{}
+	leaderTime  atomic.Int64
+	schema      atomic.Int64
+	hashMu      sync.Mutex
+	hashes      []appliedHash
+	subscribers []func(Events)
 }
+
+const baselineSchema = 1
 
 var migrations = []string{
 	`CREATE TABLE users (
@@ -175,9 +191,31 @@ var migrations = []string{
 		alert_msisdn TEXT,
 		held_until INTEGER,
 		last_time_stamp INTEGER,
-		updated_at INTEGER NOT NULL
+		claim_term INTEGER,
+		claim_index INTEGER,
+		claimed_at INTEGER,
+		alerted_at INTEGER,
+		next_attempt_at INTEGER,
+		updated_at INTEGER NOT NULL,
+		CHECK ((claim_term IS NULL) = (claim_index IS NULL) AND (claim_term IS NULL) = (claimed_at IS NULL))
 	);
+	CREATE INDEX recipients_claim_term ON recipients (claim_term) WHERE claim_term IS NOT NULL;
 	CREATE INDEX recipients_alert_msisdn ON recipients (alert_msisdn);
+	CREATE INDEX recipients_due ON recipients (next_attempt_at, msisdn) WHERE next_attempt_at IS NOT NULL;
+	CREATE TRIGGER messages_due_insert AFTER INSERT ON messages WHEN NEW.status = 'pending' BEGIN
+		INSERT INTO recipients (msisdn, next_attempt_at, updated_at) VALUES (NEW.msisdn, NEW.next_attempt_at, NEW.updated_at)
+		ON CONFLICT (msisdn) DO UPDATE SET next_attempt_at = COALESCE(MIN(next_attempt_at, excluded.next_attempt_at),
+		excluded.next_attempt_at);
+	END;
+	CREATE TRIGGER messages_due_update AFTER UPDATE OF status, next_attempt_at ON messages
+	WHEN OLD.status = 'pending' OR NEW.status = 'pending' BEGIN
+		UPDATE recipients SET next_attempt_at = (SELECT MIN(next_attempt_at) FROM messages
+		WHERE msisdn = NEW.msisdn AND status = 'pending') WHERE msisdn = NEW.msisdn;
+	END;
+	CREATE TRIGGER messages_due_delete AFTER DELETE ON messages WHEN OLD.status = 'pending' BEGIN
+		UPDATE recipients SET next_attempt_at = (SELECT MIN(next_attempt_at) FROM messages
+		WHERE msisdn = OLD.msisdn AND status = 'pending') WHERE msisdn = OLD.msisdn;
+	END;
 	CREATE TABLE operator (
 		id INTEGER PRIMARY KEY CHECK (id = 1),
 		mcc TEXT NOT NULL,
@@ -264,52 +302,181 @@ var migrations = []string{
 		expires_at INTEGER NOT NULL,
 		next_attempt_at INTEGER NOT NULL,
 		attempts INTEGER NOT NULL,
+		claimed_by TEXT,
 		result TEXT CHECK (result IN ('acknowledged', 'rejected', 'expired', 'no_user_data')),
 		UNIQUE (message_id, type),
 		CHECK (type = 'receipt' AND tp_status IS NOT NULL AND attempt_id IS NULL
 			OR type = 'sim_answer' AND attempt_id IS NOT NULL AND tp_status IS NULL)
 	);
 	CREATE INDEX smpp_notifications_due ON smpp_notifications (next_attempt_at) WHERE result IS NULL;
-	CREATE INDEX smpp_notifications_message_id ON smpp_notifications (message_id);`,
+	CREATE INDEX smpp_notifications_message_id ON smpp_notifications (message_id);
+	CREATE TABLE smpp_sessions (
+		node_id TEXT NOT NULL,
+		session_id INTEGER NOT NULL,
+		esme_id INTEGER NOT NULL REFERENCES esmes (id) ON DELETE CASCADE,
+		bind_type TEXT NOT NULL CHECK (bind_type IN ('transmitter', 'receiver', 'transceiver')),
+		remote TEXT NOT NULL,
+		bound_at INTEGER NOT NULL,
+		PRIMARY KEY (node_id, session_id)
+	) WITHOUT ROWID;
+	CREATE INDEX smpp_sessions_esme_id ON smpp_sessions (esme_id);
+	CREATE TABLE fsm_state (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		applied_index INTEGER NOT NULL,
+		applied_term INTEGER NOT NULL,
+		hash BLOB NOT NULL,
+		leader_time INTEGER NOT NULL,
+		configuration BLOB,
+		configuration_index INTEGER NOT NULL,
+		durable_writes INTEGER NOT NULL
+	);
+	INSERT INTO fsm_state VALUES (1, 0, 0, zeroblob(32), 0, NULL, 0, 0);
+	CREATE TABLE applied_requests (
+		request_id BLOB PRIMARY KEY CHECK (length(request_id) = 16),
+		result BLOB NOT NULL,
+		applied_at INTEGER NOT NULL
+	) WITHOUT ROWID;
+	CREATE INDEX applied_requests_applied_at ON applied_requests (applied_at);
+	CREATE TABLE cluster (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		cluster_id TEXT NOT NULL CHECK (length(cluster_id) = 36),
+		join_key BLOB NOT NULL CHECK (length(join_key) >= 32)
+	);
+	CREATE TABLE cluster_members (
+		node_id TEXT PRIMARY KEY CHECK (length(node_id) = 36),
+		address TEXT NOT NULL,
+		fingerprint TEXT UNIQUE,
+		schema_version INTEGER NOT NULL,
+		version TEXT NOT NULL,
+		joined_at INTEGER NOT NULL,
+		drain_state TEXT NOT NULL DEFAULT 'active' CHECK (drain_state IN ('active', 'draining', 'drained')),
+		display_name TEXT NOT NULL DEFAULT ''
+	);
+	CREATE UNIQUE INDEX cluster_members_address ON cluster_members (address) WHERE address != '';
+	CREATE TABLE cluster_join_tokens (
+		token_id TEXT PRIMARY KEY CHECK (token_id != ''),
+		expires_at INTEGER NOT NULL,
+		node_id TEXT,
+		fingerprint TEXT,
+		CHECK ((node_id IS NULL) = (fingerprint IS NULL))
+	);`,
 }
 
-func Open(ctx context.Context, path string) (*DB, error) {
+type Option func(*DB)
+
+func WithClock(now func() time.Time) Option {
+	return func(d *DB) {
+		if l, ok := d.proposer.(*localProposer); ok {
+			l.now = now
+		}
+	}
+}
+
+func Open(ctx context.Context, path string, opts ...Option) (*DB, error) {
 	if err := restrict(path); err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	conn, err := sql.Open("sqlite3", "file:"+path+"?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000&_stmt_cache_size=64")
-	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
-	}
+	d := &DB{path: path, metrics: newMetrics()}
 
-	conn.SetMaxOpenConns(1)
-
-	if err := conn.PingContext(ctx); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("open database: %w", err)
-	}
-
-	d := &DB{conn: conn, path: path, metrics: newMetrics()}
-	if err := d.migrate(ctx); err != nil {
-		_ = conn.Close()
+	if err := d.openConns(ctx); err != nil {
 		return nil, err
+	}
+
+	state, err := readFSMState(ctx, d.writer)
+	if err != nil {
+		_ = d.Close()
+		return nil, fmt.Errorf("open database: read state: %w", err)
+	}
+
+	d.setApplied(state.appliedIndex)
+	d.leaderTime.Store(state.leaderTime)
+	d.proposer = &localProposer{d: d, now: time.Now, last: state.leaderTime}
+
+	for _, opt := range opts {
+		opt(d)
 	}
 
 	return d, nil
 }
 
+const dsnParams = "_foreign_keys=on&_journal_mode=WAL&_busy_timeout=5000&_stmt_cache_size=64"
+
+func (d *DB) openConns(ctx context.Context) error {
+	writer, err := sql.Open("sqlite3", "file:"+d.path+"?"+dsnParams+"&_txlock=immediate")
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+
+	writer.SetMaxOpenConns(1)
+	writer.SetMaxIdleConns(1)
+
+	if _, err := writer.ExecContext(ctx, "PRAGMA wal_autocheckpoint = 0"); err != nil {
+		_ = writer.Close()
+		return fmt.Errorf("open database: %w", err)
+	}
+
+	d.writer = writer
+
+	if err := d.migrate(ctx); err != nil {
+		_ = writer.Close()
+		return err
+	}
+
+	reader, err := sql.Open("sqlite3", "file:"+d.path+"?"+dsnParams+"&_query_only=1")
+	if err != nil {
+		_ = writer.Close()
+		return fmt.Errorf("open database: %w", err)
+	}
+
+	reader.SetMaxOpenConns(readConns)
+	reader.SetMaxIdleConns(readConns)
+
+	if err := reader.PingContext(ctx); err != nil {
+		_ = writer.Close()
+		_ = reader.Close()
+
+		return fmt.Errorf("open database: %w", err)
+	}
+
+	checkpoints, err := startCheckpointer(ctx, d.path, writer)
+	if err != nil {
+		_ = writer.Close()
+		_ = reader.Close()
+
+		return fmt.Errorf("open database: %w", err)
+	}
+
+	d.checkpoints = checkpoints
+
+	if old := d.readers.Swap(reader); old != nil {
+		_ = old.Close()
+	}
+
+	return nil
+}
+
+func (d *DB) closeConns() error {
+	return errors.Join(d.checkpoints.stop(), d.reader().Close(), d.writer.Close())
+}
+
+func (d *DB) reader() *sql.DB {
+	return d.readers.Load()
+}
+
+const readConns = 8
+
 func (d *DB) Ping(ctx context.Context) error {
-	return d.conn.PingContext(ctx)
+	return d.reader().PingContext(ctx)
 }
 
 func (d *DB) Close() error {
-	return d.conn.Close()
+	return d.closeConns()
 }
 
 func (d *DB) migrate(ctx context.Context) error {
 	var version int
-	if err := d.conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+	if err := d.writer.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("read schema version: %w", err)
 	}
 
@@ -317,8 +484,14 @@ func (d *DB) migrate(ctx context.Context) error {
 		return fmt.Errorf("schema version %d is newer than this binary supports (%d)", version, len(migrations))
 	}
 
-	for i := version; i < len(migrations); i++ {
-		tx, err := d.conn.BeginTx(ctx, nil)
+	d.schema.Store(int64(version))
+
+	if version > 0 {
+		return nil
+	}
+
+	for i := range baselineSchema {
+		tx, err := d.writer.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("migration %d: %w", i+1, err)
 		}
@@ -336,6 +509,8 @@ func (d *DB) migrate(ctx context.Context) error {
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("migration %d: %w", i+1, err)
 		}
+
+		d.schema.Store(int64(i + 1))
 	}
 
 	return nil
