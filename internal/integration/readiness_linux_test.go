@@ -96,7 +96,13 @@ func (n *node) waitReady(query string) {
 func (n *node) waitFailing(query, name string) {
 	n.t.Helper()
 
-	eventually(n.t, n.name+" failing "+name, func() error {
+	n.waitFailingWithin(waitTimeout, query, name)
+}
+
+func (n *node) waitFailingWithin(timeout time.Duration, query, name string) {
+	n.t.Helper()
+
+	within(n.t, timeout, n.name+" failing "+name, func() error {
 		code, r, err := n.readyz(query)
 		if err != nil {
 			return err
@@ -176,7 +182,7 @@ func TestReadinessOfASingleNode(t *testing.T) {
 		names = append(names, c.Name)
 	}
 
-	want := "shutdown,member,initialized,diameter_label,drain,consistent,database,leader,caught_up,cluster"
+	want := "shutdown,member,initialized,diameter_label,drain,database,leader,cluster"
 	if got := strings.Join(names, ","); got != want {
 		t.Fatalf("checks = %s, want %s", got, want)
 	}
@@ -270,41 +276,6 @@ func TestFrozenLeaderLeavesTheOthersReady(t *testing.T) {
 	leader.waitReady("")
 }
 
-func TestRestartedNodeIsUnreadyUntilCaughtUp(t *testing.T) {
-	cl := newCluster(t)
-	leader := cl.leader()
-	n := cl.followers(leader)[0]
-
-	n.stop()
-
-	for i := range 50 {
-		leader.must(http.MethodPut, "/api/v1/cluster/members/"+leader.id,
-			map[string]string{"display_name": fmt.Sprintf("leader-%d", i)}, nil)
-	}
-
-	n.launch()
-
-	sawUnready := false
-
-	eventually(t, n.name+" ready after its restart", func() error {
-		code, r, err := n.readyz("")
-
-		switch {
-		case err != nil:
-			return err
-		case code != http.StatusOK:
-			sawUnready = true
-			return fmt.Errorf("readyz = %d: %s", code, r.failing())
-		}
-
-		return nil
-	})
-
-	if !sawUnready {
-		t.Fatal("the restarted node was ready from its first answer")
-	}
-}
-
 func TestClusterCheckWithAVoterDown(t *testing.T) {
 	cl := newCluster(t)
 	leader := cl.leader()
@@ -312,6 +283,8 @@ func TestClusterCheckWithAVoterDown(t *testing.T) {
 	up := cl.followers(leader)[1]
 
 	leader.waitReady("?cluster=true")
+	up.waitFailing("?cluster=true", "cluster")
+	up.waitReady("")
 
 	down.stop()
 
