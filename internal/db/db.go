@@ -391,6 +391,7 @@ var migrations = []string{
 		fingerprint TEXT,
 		CHECK ((node_id IS NULL) = (fingerprint IS NULL))
 	);`,
+	`ALTER TABLE users DROP COLUMN role_pinned;`,
 }
 
 type Option func(*DB)

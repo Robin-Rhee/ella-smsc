@@ -20,7 +20,6 @@ type User struct {
 	ID           int64
 	Email        string
 	Role         Role
-	RolePinned   bool
 	PasswordHash string
 	HasIdentity  bool
 }
@@ -60,7 +59,14 @@ func (d *DB) CreateUser(ctx context.Context, u NewUser, maxUsers int) (id int64,
 }
 
 func applyCreateUser(a *applyCtx, p createUserCmd) (int64, error) {
-	return createUser(a.ctx, a.tx, p.User, p.MaxUsers)
+	id, err := createUser(a.ctx, a.tx, p.User, p.MaxUsers)
+	if err != nil || a.schema >= ssoLinkSchema || !p.User.RolePinned {
+		return id, err
+	}
+
+	_, err = a.tx.ExecContext(a.ctx, `UPDATE users SET role_pinned = 1 WHERE id = ?`, id)
+
+	return id, err
 }
 
 func createUser(ctx context.Context, tx *sql.Tx, u NewUser, maxUsers int) (int64, error) {
@@ -73,8 +79,8 @@ func createUser(ctx context.Context, tx *sql.Tx, u NewUser, maxUsers int) (int64
 		return 0, ErrTooManyUsers
 	}
 
-	res, err := tx.ExecContext(ctx, `INSERT INTO users (email, role_id, role_pinned, password_hash) VALUES (?, ?, ?, ?)`,
-		u.Email, u.Role, u.RolePinned, nullString(u.PasswordHash))
+	res, err := tx.ExecContext(ctx, `INSERT INTO users (email, role_id, password_hash) VALUES (?, ?, ?)`, u.Email,
+		u.Role, nullString(u.PasswordHash))
 	if isUnique(err) {
 		return 0, ErrAlreadyExists
 	}
@@ -138,10 +144,10 @@ type updateUserRole struct {
 	Pinned bool
 }
 
-func (d *DB) UpdateUserRole(ctx context.Context, id int64, role Role, pinned bool) (err error) {
+func (d *DB) UpdateUserRole(ctx context.Context, id int64, role Role) (err error) {
 	defer d.observe(&err)()
 
-	if _, err := submit[struct{}](ctx, d, cmdUpdateUserRole, updateUserRole{ID: id, Role: role, Pinned: pinned}); err != nil {
+	if _, err := submit[struct{}](ctx, d, cmdUpdateUserRole, updateUserRole{ID: id, Role: role}); err != nil {
 		return fmt.Errorf("update user role: %w", err)
 	}
 
@@ -168,9 +174,14 @@ func applyUpdateUserRole(a *applyCtx, p updateUserRole) (struct{}, error) {
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `UPDATE users SET role_id = ?, role_pinned = ? WHERE id = ?`, p.Role, p.Pinned,
-		p.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET role_id = ? WHERE id = ?`, p.Role, p.ID); err != nil {
 		return struct{}{}, err
+	}
+
+	if a.schema < ssoLinkSchema {
+		if _, err := tx.ExecContext(ctx, `UPDATE users SET role_pinned = ? WHERE id = ?`, p.Pinned, p.ID); err != nil {
+			return struct{}{}, err
+		}
 	}
 
 	if p.Role == current {
@@ -314,7 +325,7 @@ func keepPasswordAdmin(ctx context.Context, tx *sql.Tx, id int64) error {
 	return nil
 }
 
-const userColumns = `id, email, role_id, role_pinned, password_hash,
+const userColumns = `id, email, role_id, password_hash,
 	EXISTS (SELECT 1 FROM user_identities JOIN oidc ON oidc.issuer = user_identities.issuer
 		WHERE user_identities.user_id = users.id)`
 
@@ -337,7 +348,7 @@ func scanUser(row rowScanner) (User, error) {
 		hash sql.NullString
 	)
 
-	err := row.Scan(&u.ID, &u.Email, &u.Role, &u.RolePinned, &hash, &u.HasIdentity)
+	err := row.Scan(&u.ID, &u.Email, &u.Role, &hash, &u.HasIdentity)
 	u.PasswordHash = hash.String
 
 	return u, err
