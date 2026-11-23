@@ -5,8 +5,9 @@ import { authFor } from "@/contexts/AuthContext";
 import Dashboard from "@/pages/Dashboard";
 import { RoleID } from "@/queries/users";
 import { formatDateTime } from "@/utils/dates";
-import { clusterMember, clusterStatus } from "@/test/fixtures";
 import { json, renderWithClient, stubApi } from "@/test/render";
+
+const ALERT_COLOR = "rgb(198, 40, 40)";
 
 const peer = (host: string, state: string, address: string) => ({
   host,
@@ -505,53 +506,78 @@ describe("Dashboard", () => {
   it("shows the healthy voters of the cluster", async () => {
     serve({
       routes: {
-        "/api/v1/cluster": () =>
+        "/api/v1/cluster/health": () =>
           json(200, {
-            result: clusterStatus({
-              healthy: false,
-              members: [
-                clusterMember({ leader: true }),
-                clusterMember({ node_id: "b", healthy: false }),
-                clusterMember({ node_id: "c", suffrage: "nonvoter" }),
-              ],
-            }),
+            result: {
+              state: "healthy",
+              total_voters: 3,
+              healthy_voters: 3,
+              failure_tolerance: 1,
+            },
+          }),
+      },
+    });
+    render();
+
+    const ratio = await within(card("High Availability")).findByText("3/3");
+    expect(getComputedStyle(ratio).color).not.toBe(ALERT_COLOR);
+  });
+
+  it("alerts when a voter is unhealthy", async () => {
+    serve({
+      routes: {
+        "/api/v1/cluster/health": () =>
+          json(200, {
+            result: {
+              state: "degraded",
+              total_voters: 3,
+              healthy_voters: 2,
+              failure_tolerance: 0,
+            },
+          }),
+      },
+    });
+    render();
+
+    const ratio = await within(card("High Availability")).findByText("2/3");
+    expect(getComputedStyle(ratio).color).toBe(ALERT_COLOR);
+  });
+
+  it.each([
+    ["no_leader", "No leader"],
+    ["unknown", "Unknown"],
+  ] as const)("shows %s cluster health", async (state, label) => {
+    serve({
+      routes: {
+        "/api/v1/cluster/health": () =>
+          json(200, { result: { state, total_voters: 3 } }),
+      },
+    });
+    render();
+
+    expect(
+      await within(card("High Availability")).findByText(label),
+    ).toBeInTheDocument();
+  });
+
+  it("shows one healthy voter on a standalone node", async () => {
+    serve({
+      routes: {
+        "/api/v1/cluster/health": () =>
+          json(200, {
+            result: {
+              state: "healthy",
+              total_voters: 1,
+              healthy_voters: 1,
+              failure_tolerance: 0,
+            },
           }),
       },
     });
     render();
 
     expect(
-      await within(card("High Availability")).findByText("1/2"),
-    ).toBeInTheDocument();
-  });
-
-  it("leaves the cluster health to the leader on a follower", async () => {
-    serve({
-      routes: {
-        "/api/v1/cluster": () =>
-          json(200, {
-            result: clusterStatus({ leader_id: "b", healthy: undefined }),
-          }),
-      },
-    });
-    render();
-
-    expect(
-      await within(card("High Availability")).findByText("Follower"),
-    ).toBeInTheDocument();
-  });
-
-  it("shows high availability off on a standalone node", async () => {
-    serve({
-      routes: {
-        "/api/v1/cluster": () =>
-          json(200, { result: clusterStatus({ clustered: false }) }),
-      },
-    });
-    render();
-
-    expect(
-      await within(card("High Availability")).findByText("Off"),
+      await within(card("High Availability")).findByText("1/1"),
     ).toBeInTheDocument();
   });
 
